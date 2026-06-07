@@ -87,6 +87,12 @@ go run ./cmd/muxmail serve -c config.yaml
 
 ## API
 
+Current version:
+
+```text
+0.1.0
+```
+
 Machine-readable API contract:
 
 ```text
@@ -239,9 +245,16 @@ Health endpoints:
 ```text
 GET /healthz
 GET /readyz
+GET /version
 ```
 
 ## Deployment Notes
+
+- Published images are available from GHCR:
+
+```sh
+docker pull ghcr.io/feng005211/muxmail:latest
+```
 
 - `muxmail serve -c config.yaml` is the MVP process model.
 - The serve process starts both the HTTP API and the in-memory worker.
@@ -249,6 +262,7 @@ GET /readyz
 - Mount config at `/etc/muxmail/config.yaml` and data at `/var/lib/muxmail`.
 - In containers, set `logging.dir` to `/var/lib/muxmail/logs` and `suppression_file` to `/var/lib/muxmail/suppression.yaml`.
 - Keep real API keys and provider secrets in environment variables or secret files.
-- `compose.example.yaml` mounts `config.container.example.yaml` by default as a strict-mode-ready container example.
+- `compose.example.yaml` uses `ghcr.io/feng005211/muxmail:latest` and mounts `config.container.example.yaml` by default as a strict-mode-ready container example.
+- Release versions are read from `VERSION`; GitHub Release tags must be `v${VERSION}`.
 
 See [docs/deployment.md](docs/deployment.md) for Docker and 1Panel notes.

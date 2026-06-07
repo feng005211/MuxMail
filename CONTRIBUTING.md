@@ -23,6 +23,17 @@ make verify
 
 This runs tests, `go vet`, example config validation, container config strict validation, dry-run, and build.
 
+## Releases
+
+- `VERSION` is the single source of truth for release identity.
+- `VERSION` must use `MAJOR.MINOR.PATCH`, for example `0.1.0`.
+- GitHub Release tags must be `v${VERSION}`, for example `v0.1.0`.
+- Before `1.0.0`, bump `PATCH` only for fixes, CI, documentation, or test-only changes that do not change public API, configuration shape, JSONL schema, runtime behavior, or deployment behavior.
+- Before `1.0.0`, bump `MINOR` for every release-facing API, configuration, JSONL schema, runtime, provider, or deployment behavior change.
+- Starting with `1.0.0`, use strict SemVer: `MAJOR` for breaking changes, `MINOR` for backward-compatible features, and `PATCH` for backward-compatible fixes.
+- Update `CHANGELOG.md`, `docs/openapi.yaml`, README files, and deployment docs when a release-facing behavior changes.
+- The publish workflow rejects a tag when it does not match `VERSION`.
+
 ## Tests
 
 - Use fake or mock provider adapters in automated tests.

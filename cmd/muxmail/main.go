@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/muxmail/muxmail"
 	"github.com/muxmail/muxmail/internal/api"
 	"github.com/muxmail/muxmail/internal/config"
 	"github.com/muxmail/muxmail/internal/domain"
@@ -23,6 +24,7 @@ const helpText = `MuxMail
 
 Usage:
   muxmail help
+  muxmail version
   muxmail serve -c config.yaml
   muxmail config validate -c config.yaml [--strict]
   muxmail send dry-run -c config.yaml --app project_a --scene register_code --to user@example.com --locale en-US
@@ -38,6 +40,10 @@ func main() {
 func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		fmt.Fprint(stdout, helpText)
+		return nil
+	}
+	if args[0] == "version" || args[0] == "--version" || args[0] == "-v" {
+		fmt.Fprintf(stdout, "muxmail %s\n", muxmail.Version())
 		return nil
 	}
 
@@ -103,7 +109,7 @@ func runServe(args []string, stdout io.Writer, stderr io.Writer) error {
 		workerDone <- workerRuntime.Run(ctx)
 	}()
 
-	fmt.Fprintf(stdout, "muxmail listening on %s\n", cfg.Server.Listen)
+	fmt.Fprintf(stdout, "muxmail %s listening on %s\n", muxmail.Version(), cfg.Server.Listen)
 	if err := runtime.Serve(ctx); err != nil {
 		cancel()
 		_ = runtime.Close()

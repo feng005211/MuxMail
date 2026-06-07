@@ -303,16 +303,59 @@ $env:GOCACHE = (Join-Path (Get-Location) '.gocache')
 make verify
 ```
 
-## 6. Docker Compose 部署
+## 6. Docker 部署
 
-仓库里已经提供了 [compose.example.yaml](D:/Coding/Go/MuxMail/compose.example.yaml)。生产环境建议复制成自己的 `compose.yaml`，再替换镜像名、环境变量和值。
+MuxMail 镜像由 GitHub Actions 自动构建并发布到 GHCR：
+
+```text
+ghcr.io/feng005211/muxmail:latest
+```
+
+版本号的唯一来源是仓库根目录的 `VERSION` 文件，格式固定为 `MAJOR.MINOR.PATCH`。GitHub Release tag 必须是 `v${VERSION}`，例如 `VERSION` 为 `0.1.0` 时，发布 tag 必须是 `v0.1.0`。发布工作流会拒绝不匹配的 tag。
+
+版本递增规则固定为：`1.0.0` 前，`PATCH` 只用于不改变公开 API、配置结构、JSONL schema、运行行为或部署行为的修复、CI、文档和测试更新；任何面向发布的 API、配置、JSONL schema、运行、Provider 或部署行为变化都递增 `MINOR`。从 `1.0.0` 开始，严格按 SemVer 使用 `MAJOR`、`MINOR`、`PATCH`。
+
+`main` 分支会发布 `latest`、`main` 和 `sha-...` 标签。版本标签 `v1.2.3` 会发布 `v1.2.3`、`1.2.3` 和 `1.2` 标签，并创建同名 GitHub Release。
+
+容器内可以用下面的命令确认系统内部版本：
+
+```text
+muxmail version
+```
+
+运行中的服务也暴露只读版本端点：
+
+```text
+GET /version
+```
+
+首次发布后，如果 GHCR 包没有自动继承公开仓库权限，需要在 GitHub Packages 页面把 `muxmail` 包设为 Public，否则匿名用户无法直接拉取镜像。
+
+### 6.1 docker run
+
+如果你已经在当前目录准备了 `config.yaml`、`.env` 和 `data/`，可以直接运行：
+
+```text
+docker run -d \
+  --name muxmail \
+  --restart unless-stopped \
+  --env-file .env \
+  -p 8080:8080 \
+  -v "$(pwd)/config.yaml:/etc/muxmail/config.yaml:ro" \
+  -v "$(pwd)/data:/var/lib/muxmail" \
+  ghcr.io/feng005211/muxmail:latest
+```
+
+### 6.2 Docker Compose
+
+仓库里已经提供了 [compose.example.yaml](D:/Coding/Go/MuxMail/compose.example.yaml)。生产环境建议复制成自己的 `compose.yaml`，再替换环境变量和值。
 
 一个最小可用的 Compose 例子如下：
 
 ```yaml
 services:
   muxmail:
-    image: muxmail:local
+    image: ghcr.io/feng005211/muxmail:latest
     container_name: muxmail
     restart: unless-stopped
     ports:

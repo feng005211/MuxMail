@@ -1,15 +1,14 @@
 services:
   muxmail:
-    build: .
-    image: muxmail:local
+    image: ghcr.io/feng005211/muxmail:latest
     container_name: muxmail
     restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
-      PROJECT_A_MUXMAIL_KEY: "change-me"
-      BREVO_API_KEY: "change-me"
-      RESEND_API_KEY: "change-me"
+      PROJECT_A_MUXMAIL_KEY: "mk_test_replace_with_at_least_24_bytes"
+      BREVO_API_KEY: "replace-with-brevo-api-key"
+      RESEND_API_KEY: "replace-with-resend-api-key"
     volumes:
       - ./config.container.example.yaml:/etc/muxmail/config.yaml:ro
       - muxmail-data:/var/lib/muxmail

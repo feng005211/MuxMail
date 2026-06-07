@@ -1,12 +1,14 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/muxmail/muxmail"
 	"github.com/muxmail/muxmail/internal/config"
 )
 
@@ -58,6 +60,28 @@ func TestRuntimeReadyAfterCloseReturnsNotReady(t *testing.T) {
 	}
 	if recorder.Body.String() != `{"status":"not_ready"}` {
 		t.Fatalf("unexpected body: %q", recorder.Body.String())
+	}
+}
+
+func TestRuntimeVersionEndpointReturnsEmbeddedVersion(t *testing.T) {
+	runtime := openTestRuntime(t, "off")
+	defer runtime.Close()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/version", nil)
+	runtime.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	var body struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode version response: %v", err)
+	}
+	if body.Version != muxmail.Version() {
+		t.Fatalf("expected version %q, got %q", muxmail.Version(), body.Version)
 	}
 }
 

@@ -49,6 +49,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NotReadyResponse"
+  /version:
+    get:
+      tags: [Health]
+      summary: Build version
+      security: []
+      responses:
+        "200":
+          description: Current MuxMail version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionResponse"
   /v1/mail/send:
     post:
       tags: [Send]
@@ -507,6 +519,13 @@ components:
         status:
           type: string
           enum: [not_ready]
+    VersionResponse:
+      type: object
+      required: [version]
+      properties:
+        version:
+          type: string
+          example: 0.1.0
     ErrorResponse:
       type: object
       required: [error]

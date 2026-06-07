@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/muxmail/muxmail"
 )
 
 func TestRunConfigValidateRequiresConfigPath(t *testing.T) {
@@ -20,6 +22,19 @@ func TestRunConfigValidateRequiresConfigPath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "-c or --config") {
 		t.Fatalf("expected missing config path error, got %q", err.Error())
+	}
+}
+
+func TestRunVersionOutputsEmbeddedVersion(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	if err := run([]string{"version"}, &stdout, &stderr); err != nil {
+		t.Fatalf("expected version command to succeed: %v", err)
+	}
+	want := "muxmail " + muxmail.Version() + "\n"
+	if stdout.String() != want {
+		t.Fatalf("expected version output %q, got %q", want, stdout.String())
 	}
 }
 

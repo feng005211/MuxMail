@@ -89,6 +89,12 @@ go run ./cmd/muxmail serve -c config.yaml
 
 ## API
 
+当前版本：
+
+```text
+0.1.0
+```
+
 机器可读的 API 合约：
 
 ```text
@@ -242,9 +248,16 @@ Content-Type: application/json
 ```text
 GET /healthz
 GET /readyz
+GET /version
 ```
 
 ## 部署说明
+
+- 已发布的镜像可直接从 GHCR 拉取：
+
+```sh
+docker pull ghcr.io/feng005211/muxmail:latest
+```
 
 - `muxmail serve -c config.yaml` 是 MVP 的核心运行方式。
 - `serve` 进程会同时启动 HTTP API 和内存 Worker。
@@ -252,6 +265,7 @@ GET /readyz
 - 容器部署时，把配置挂载到 `/etc/muxmail/config.yaml`，把数据目录挂载到 `/var/lib/muxmail`。
 - 容器中的 `logging.dir` 应设为 `/var/lib/muxmail/logs`，`suppression_file` 应设为 `/var/lib/muxmail/suppression.yaml`。
 - 真实 API Key 和 Provider Secret 应放在环境变量或密钥文件里。
-- `compose.example.yaml` 默认把 `config.container.example.yaml` 挂载为容器示例配置。
+- `compose.example.yaml` 使用 `ghcr.io/feng005211/muxmail:latest`，并默认把 `config.container.example.yaml` 挂载为容器示例配置。
+- 发布版本从 `VERSION` 读取；GitHub Release tag 必须是 `v${VERSION}`。
 
 Docker、1Panel、本地运行和排障说明见 [docs/deployment.md](docs/deployment.md)。

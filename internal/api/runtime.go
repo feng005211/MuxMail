@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/muxmail/muxmail"
 	"github.com/muxmail/muxmail/internal/config"
 	"github.com/muxmail/muxmail/internal/lite"
 )
@@ -196,6 +197,7 @@ func (r *Runtime) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", r.handleHealthz)
 	mux.HandleFunc("/readyz", r.handleReadyz)
+	mux.HandleFunc("/version", r.handleVersion)
 	mux.HandleFunc("/v1/mail/send", r.handleSend)
 	mux.HandleFunc("/v1/mail/messages/failed", r.handleFailedMessageList)
 	mux.HandleFunc("/v1/mail/messages", r.handleMessageList)
@@ -322,6 +324,15 @@ func (r *Runtime) handleReadyz(w http.ResponseWriter, request *http.Request) {
 	}
 
 	writeStatusJSON(w, http.StatusOK, `{"status":"ok"}`)
+}
+
+func (r *Runtime) handleVersion(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		http.NotFound(w, request)
+		return
+	}
+
+	writeStatusJSON(w, http.StatusOK, fmt.Sprintf(`{"version":%q}`, muxmail.Version()))
 }
 
 func newStatsSink(cfg *config.Config) (lite.StatsSink, error) {

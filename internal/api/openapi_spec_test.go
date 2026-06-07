@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/muxmail/muxmail"
 	"github.com/muxmail/muxmail/internal/domain"
 	"gopkg.in/yaml.v3"
 )
@@ -38,13 +39,14 @@ func TestOpenAPISpecParsesAndCoversCurrentRoutes(t *testing.T) {
 	if spec.Info.Title != "MuxMail API" {
 		t.Fatalf("unexpected spec title: %q", spec.Info.Title)
 	}
-	if spec.Info.Version == "" {
-		t.Fatal("expected spec version")
+	if spec.Info.Version != muxmail.Version() {
+		t.Fatalf("expected spec version %q, got %q", muxmail.Version(), spec.Info.Version)
 	}
 
 	requiredPaths := []string{
 		"/healthz",
 		"/readyz",
+		"/version",
 		"/v1/mail/send",
 		"/v1/mail/messages",
 		"/v1/mail/messages/failed",

@@ -14,8 +14,9 @@ Initial Lite-mode MVP implementation.
 - Optional normalized provider event receiver plus native Resend and Brevo webhook receivers.
 - Static YAML suppression store with bounce and complaint upsert from provider events.
 - `muxmail config validate`, strict secret validation, and `muxmail send dry-run`.
+- `muxmail version`, `GET /version`, and root `VERSION` file as the release version source of truth.
 - OpenAPI 3.1 spec for the current Lite API.
-- Dockerfile, Docker Compose example, container config example, `.dockerignore`, and deployment notes for single-container Lite mode.
+- Dockerfile, Docker Compose example, container config example, `.dockerignore`, GitHub Actions image publishing, and deployment notes for single-container Lite mode.
 
 ### Verification
 

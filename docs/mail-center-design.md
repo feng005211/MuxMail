@@ -610,6 +610,9 @@ GET /healthz
 GET /readyz
   配置加载成功、日志目录可写、内存队列已初始化时返回 200，否则返回 503。
 
+GET /version
+  返回当前 MuxMail 构建版本。
+
 POST /v1/mail/send
   业务发信接口。
 
@@ -647,7 +650,7 @@ POST /v1/provider-events/brevo
   接收 Brevo 原生 Webhook，校验 Bearer token 后映射为 MuxMail 标准 Provider Event。
 ```
 
-`/healthz` 和 `/readyz` 不需要 API Key，不输出配置、路径、密钥、Provider 状态或内部错误详情。
+`/healthz`、`/readyz` 和 `/version` 不需要 API Key，不输出配置、路径、密钥、Provider 状态或内部错误详情。`/version` 只返回 `VERSION` 文件嵌入进二进制的 SemVer 版本号。
 
 `GET /v1/mail/messages/{message_id}` 需要 App API Key，只能查询该 App 自己的消息。Lite 模式从 `mail-messages.jsonl` 和轮转备份中线性扫描同一 `message_id` 的最新状态记录。接口不返回完整收件人邮箱、邮件正文、模板变量、caller_ip、user_ip、API Key 哈希、幂等哈希或请求指纹。
 
