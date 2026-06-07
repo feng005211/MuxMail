@@ -1,0 +1,18 @@
+services:
+  muxmail:
+    build: .
+    image: muxmail:local
+    container_name: muxmail
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PROJECT_A_MUXMAIL_KEY: "change-me"
+      BREVO_API_KEY: "change-me"
+      RESEND_API_KEY: "change-me"
+    volumes:
+      - ./config.container.example.yaml:/etc/muxmail/config.yaml:ro
+      - muxmail-data:/var/lib/muxmail
+
+volumes:
+  muxmail-data:

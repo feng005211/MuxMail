@@ -1,0 +1,148 @@
+server:
+  listen: ":8080"
+  read_timeout_seconds: 10
+  read_header_timeout_seconds: 5
+  write_timeout_seconds: 15
+  idle_timeout_seconds: 60
+  trusted_proxies:
+    - 172.16.0.0/12
+    - 10.0.0.0/8
+
+runtime:
+  config_store: file
+  queue: memory
+  rate_limiter: memory
+  message_log: file
+  stats: off
+  suppression: file
+
+defaults:
+  provider_timeout_seconds: 10
+  max_attempts_per_message: 3
+  retry_backoff_seconds:
+    - 0
+    - 30
+    - 120
+  memory_queue_size: 1000
+  worker_concurrency: 4
+  idempotency_cache_size: 10000
+  idempotency_ttl_hours: 24
+  max_request_body_bytes: 65536
+  max_template_var_bytes: 8192
+  max_context_bytes: 4096
+
+apps:
+  - code: project_a
+    name: Project A
+    enabled: true
+    default_locale: en-US
+    allowed_locales:
+      - en-US
+      - zh-CN
+    api_keys:
+      - name: default
+        enabled: true
+        key_ref: env:PROJECT_A_MUXMAIL_KEY
+    templates:
+      - code: register_code_v1
+        locale: en-US
+        enabled: true
+        subject: "Your verification code"
+        required_vars:
+          - code
+          - expire_minutes
+        html_body: |
+          <p>Your verification code is {{ .code }}.</p>
+          <p>This code expires in {{ .expire_minutes }} minutes.</p>
+        text_body: |
+          Your verification code is {{ .code }}.
+          This code expires in {{ .expire_minutes }} minutes.
+      - code: register_code_v1
+        locale: zh-CN
+        enabled: true
+        subject: "Your verification code"
+        required_vars:
+          - code
+          - expire_minutes
+        html_body: |
+          <p>Your verification code is {{ .code }}.</p>
+          <p>This code expires in {{ .expire_minutes }} minutes.</p>
+        text_body: |
+          Your verification code is {{ .code }}.
+          This code expires in {{ .expire_minutes }} minutes.
+    scenes:
+      - code: register_code
+        name: Register verification code
+        enabled: true
+        template: register_code_v1
+        rate_limit:
+          same_email_per_minute: 1
+          same_email_per_day: 10
+          same_user_ip_per_hour: 20
+          same_caller_ip_per_hour: 200
+        route_policy:
+          qq.com:
+            - brevo_auth_api
+            - resend_auth_smtp_backup
+          foxmail.com:
+            - brevo_auth_api
+            - resend_auth_smtp_backup
+          gmail.com:
+            - resend_auth_api
+            - resend_auth_smtp_backup
+          "*":
+            - brevo_auth_api
+            - resend_auth_api
+
+provider_accounts:
+  - code: brevo_main
+    provider: brevo
+    enabled: true
+    credentials:
+      api_key: env:BREVO_API_KEY
+  - code: resend_main
+    provider: resend
+    enabled: true
+    credentials:
+      api_key: env:RESEND_API_KEY
+
+provider_channels:
+  - code: brevo_auth_api
+    account: brevo_main
+    transport: api
+    enabled: true
+    sender_domain: auth.example.com
+    from_name: MuxMail
+    from: no-reply@auth.example.com
+  - code: resend_auth_api
+    account: resend_main
+    transport: api
+    enabled: true
+    sender_domain: auth-bak.example.com
+    from_name: MuxMail
+    from: no-reply@auth-bak.example.com
+  - code: resend_auth_smtp_backup
+    account: resend_main
+    transport: smtp
+    enabled: true
+    sender_domain: auth-smtp.example.com
+    from_name: MuxMail
+    from: no-reply@auth-smtp.example.com
+    smtp:
+      host: smtp.resend.com
+      port: 587
+      username: resend
+      password_ref: env:RESEND_API_KEY
+
+webhooks:
+  enabled: false
+  shared_secret_ref: ""
+  resend_secret_ref: ""
+  brevo_token_ref: ""
+
+logging:
+  dir: /var/lib/muxmail/logs
+  max_file_size_mb: 100
+  max_backups: 5
+
+suppression_file: /var/lib/muxmail/suppression.yaml

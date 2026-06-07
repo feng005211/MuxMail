@@ -1,0 +1,12 @@
+.git
+.gocache
+.qodo
+bin
+data
+config.yaml
+config.local.yaml
+*.test
+*.out
+coverage.out
+muxmail
+muxmail.exe

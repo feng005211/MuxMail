@@ -1,0 +1,841 @@
+openapi: 3.1.0
+info:
+  title: MuxMail API
+  version: 0.1.0
+  description: |
+    OpenAPI description for the current MuxMail Lite HTTP API.
+
+    This spec covers the file-config, in-memory queue, JSONL log runtime that is
+    currently implemented in the repository.
+servers:
+  - url: http://localhost:8080
+security:
+  - AppBearerAuth: []
+tags:
+  - name: Health
+  - name: Send
+  - name: Messages
+  - name: Suppressions
+  - name: ProviderEvents
+  - name: Stats
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      security: []
+      responses:
+        "200":
+          description: Runtime is ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: Runtime is not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotReadyResponse"
+  /v1/mail/send:
+    post:
+      tags: [Send]
+      summary: Enqueue one transactional email
+      security:
+        - AppBearerAuth: []
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendRequest"
+      responses:
+        "202":
+          description: Message accepted and queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendResponse"
+        "4XX":
+          description: Validation, auth, rate-limit, or queue admission error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "5XX":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/mail/messages:
+    get:
+      tags: [Messages]
+      summary: List latest message snapshots for the authenticated App
+      security:
+        - AppBearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: status
+          schema:
+            $ref: "#/components/schemas/MessageStatus"
+        - in: query
+          name: scene
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Latest message snapshots
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageListResponse"
+        "401":
+          description: Missing or invalid App API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Invalid query filter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/mail/messages/failed:
+    get:
+      tags: [Messages]
+      summary: List recent failed messages for the authenticated App
+      security:
+        - AppBearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: scene
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Failed message snapshots
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageListResponse"
+        "401":
+          description: Missing or invalid App API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Invalid query filter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/mail/messages/{message_id}:
+    get:
+      tags: [Messages]
+      summary: Query the latest message status snapshot
+      security:
+        - AppBearerAuth: []
+      parameters:
+        - in: path
+          name: message_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Latest message snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageStatusResponse"
+        "401":
+          description: Missing or invalid App API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Message not found in the authenticated App
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/mail/messages/{message_id}/events:
+    get:
+      tags: [Messages]
+      summary: Query the provider event timeline for one message
+      security:
+        - AppBearerAuth: []
+      parameters:
+        - in: path
+          name: message_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Provider event timeline
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageEventsResponse"
+        "401":
+          description: Missing or invalid App API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Message not found in the authenticated App
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/mail/messages/{message_id}/attempts:
+    get:
+      tags: [Messages]
+      summary: Query the provider attempt timeline for one message
+      security:
+        - AppBearerAuth: []
+      parameters:
+        - in: path
+          name: message_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Provider attempt timeline
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageAttemptsResponse"
+        "401":
+          description: Missing or invalid App API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Message not found in the authenticated App
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/suppressions:
+    get:
+      tags: [Suppressions]
+      summary: List suppressions for the authenticated App
+      security:
+        - AppBearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: reason
+          schema:
+            $ref: "#/components/schemas/SuppressionReason"
+        - in: query
+          name: email
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Suppression list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuppressionListResponse"
+        "401":
+          description: Missing or invalid App API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Invalid query filter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/provider-events:
+    get:
+      tags: [ProviderEvents]
+      summary: List recent provider events for the authenticated App
+      security:
+        - AppBearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - in: query
+          name: provider
+          schema:
+            $ref: "#/components/schemas/Provider"
+        - in: query
+          name: event_type
+          schema:
+            $ref: "#/components/schemas/ProviderEventType"
+      responses:
+        "200":
+          description: Recent provider events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderEventListResponse"
+        "401":
+          description: Missing or invalid App API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Invalid query filter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      tags: [ProviderEvents]
+      summary: Accept one normalized provider event
+      security:
+        - WebhookBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderEventRequest"
+      responses:
+        "202":
+          description: Event accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderEventResponse"
+        "4XX":
+          description: Auth or validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "5XX":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/provider-events/resend:
+    post:
+      tags: [ProviderEvents]
+      summary: Accept one native Resend webhook event
+      security: []
+      parameters:
+        - in: header
+          name: svix-id
+          required: true
+          schema:
+            type: string
+        - in: header
+          name: svix-timestamp
+          required: true
+          schema:
+            type: string
+        - in: header
+          name: svix-signature
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "202":
+          description: Event accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderEventResponse"
+        "4XX":
+          description: Auth or validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "5XX":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/provider-events/brevo:
+    post:
+      tags: [ProviderEvents]
+      summary: Accept one native Brevo webhook event
+      security:
+        - WebhookBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "202":
+          description: Event accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderEventResponse"
+        "4XX":
+          description: Auth or validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "5XX":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/stats/summary:
+    get:
+      tags: [Stats]
+      summary: Query an App-scoped stats summary
+      security:
+        - AppBearerAuth: []
+      parameters:
+        - in: query
+          name: window
+          schema:
+            type: string
+            enum: [1h, 24h, 7d]
+            default: 24h
+      responses:
+        "200":
+          description: Stats summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsSummaryResponse"
+        "401":
+          description: Missing or invalid App API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Invalid query filter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  securitySchemes:
+    AppBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API key
+      description: App API key used for send and read-only App-scoped queries.
+    WebhookBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: webhook secret
+      description: Shared webhook secret used by MuxMail normalized provider events and Brevo webhook events.
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+    NotReadyResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [not_ready]
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              $ref: "#/components/schemas/ErrorCode"
+            message:
+              type: string
+            request_id:
+              type: string
+    SendRequest:
+      type: object
+      required: [scene, to, vars]
+      properties:
+        scene:
+          type: string
+        to:
+          type: string
+        locale:
+          type: string
+        vars:
+          type: object
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: number
+              - type: boolean
+        context:
+          type: object
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: number
+              - type: boolean
+    SendResponse:
+      type: object
+      required: [request_id, message_id, status]
+      properties:
+        request_id:
+          type: string
+        message_id:
+          type: string
+        status:
+          $ref: "#/components/schemas/MessageStatus"
+    MessageStatusResponse:
+      type: object
+      required: [message_id, request_id, app, scene, status, locale, to_domain, to_hash, updated_at]
+      properties:
+        message_id:
+          type: string
+        request_id:
+          type: string
+        business_request_id:
+          type: string
+        app:
+          type: string
+        scene:
+          type: string
+        status:
+          $ref: "#/components/schemas/MessageStatus"
+        locale:
+          type: string
+        to_domain:
+          type: string
+        to_hash:
+          type: string
+        error_code:
+          $ref: "#/components/schemas/ErrorCode"
+        error_message:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+    MessageListResponse:
+      type: object
+      required: [app, limit, messages]
+      properties:
+        app:
+          type: string
+        limit:
+          type: integer
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageStatusResponse"
+    MessageEventsResponse:
+      type: object
+      required: [message_id, app, events]
+      properties:
+        message_id:
+          type: string
+        app:
+          type: string
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageEventEntry"
+    MessageEventEntry:
+      type: object
+      required: [logged_at, provider, provider_account, provider_channel, provider_message_id, event_type]
+      properties:
+        logged_at:
+          type: string
+          format: date-time
+        provider:
+          $ref: "#/components/schemas/Provider"
+        provider_account:
+          type: string
+        provider_channel:
+          type: string
+        provider_message_id:
+          type: string
+        event_type:
+          $ref: "#/components/schemas/ProviderEventType"
+        occurred_at:
+          type: string
+    MessageAttemptsResponse:
+      type: object
+      required: [message_id, app, attempts]
+      properties:
+        message_id:
+          type: string
+        app:
+          type: string
+        attempts:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageAttemptEntry"
+    MessageAttemptEntry:
+      type: object
+      required: [logged_at, attempt_no, provider, provider_account, provider_channel, transport, status, duration_ms]
+      properties:
+        logged_at:
+          type: string
+          format: date-time
+        attempt_no:
+          type: integer
+        provider:
+          $ref: "#/components/schemas/Provider"
+        provider_account:
+          type: string
+        provider_channel:
+          type: string
+        transport:
+          $ref: "#/components/schemas/Transport"
+        status:
+          $ref: "#/components/schemas/AttemptStatus"
+        failure_class:
+          $ref: "#/components/schemas/FailureClass"
+        error_code:
+          $ref: "#/components/schemas/ErrorCode"
+        provider_message_id:
+          type: string
+        duration_ms:
+          type: integer
+    SuppressionListResponse:
+      type: object
+      required: [app, limit, suppressions]
+      properties:
+        app:
+          type: string
+        limit:
+          type: integer
+        suppressions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SuppressionEntry"
+    SuppressionEntry:
+      type: object
+      required: [email, normalized_email, reason]
+      properties:
+        email:
+          type: string
+        normalized_email:
+          type: string
+        reason:
+          $ref: "#/components/schemas/SuppressionReason"
+    ProviderEventListResponse:
+      type: object
+      required: [app, limit, events]
+      properties:
+        app:
+          type: string
+        limit:
+          type: integer
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderEventListEntry"
+    ProviderEventListEntry:
+      type: object
+      required: [message_id, logged_at, provider, provider_account, provider_channel, provider_message_id, event_type]
+      properties:
+        message_id:
+          type: string
+        logged_at:
+          type: string
+          format: date-time
+        provider:
+          $ref: "#/components/schemas/Provider"
+        provider_account:
+          type: string
+        provider_channel:
+          type: string
+        provider_message_id:
+          type: string
+        event_type:
+          $ref: "#/components/schemas/ProviderEventType"
+        occurred_at:
+          type: string
+    ProviderEventRequest:
+      type: object
+      required: [app, message_id, provider, event_type, occurred_at]
+      properties:
+        app:
+          type: string
+        message_id:
+          type: string
+        provider:
+          $ref: "#/components/schemas/Provider"
+        provider_account:
+          type: string
+        provider_channel:
+          type: string
+        provider_message_id:
+          type: string
+        recipient_email:
+          type: string
+        event_type:
+          $ref: "#/components/schemas/ProviderEventType"
+        event_payload:
+          type: string
+        occurred_at:
+          type: string
+    ProviderEventResponse:
+      type: object
+      required: [message_id, app, status]
+      properties:
+        message_id:
+          type: string
+        app:
+          type: string
+        status:
+          $ref: "#/components/schemas/MessageStatus"
+    StatsSummaryResponse:
+      type: object
+      required: [app, window, since, until, metrics, provider_durations]
+      properties:
+        app:
+          type: string
+        window:
+          type: string
+        since:
+          type: string
+          format: date-time
+        until:
+          type: string
+          format: date-time
+        metrics:
+          type: object
+          additionalProperties:
+            type: number
+        provider_durations:
+          type: array
+          items:
+            type: object
+            required: [provider_channel, transport, count, average_ms, total_ms]
+            properties:
+              provider_channel:
+                type: string
+              transport:
+                $ref: "#/components/schemas/Transport"
+              count:
+                type: integer
+              average_ms:
+                type: number
+              total_ms:
+                type: number
+    MessageStatus:
+      type: string
+      enum: [queued, sending, retrying, sent, failed, delivered, bounced, complained]
+    AttemptStatus:
+      type: string
+      enum: [sending, sent, failed]
+    FailureClass:
+      type: string
+      enum: ["", temporary_failure, channel_failure, message_permanent_failure]
+    Provider:
+      type: string
+      enum: [mock, resend, brevo]
+    Transport:
+      type: string
+      enum: [api, smtp]
+    ProviderEventType:
+      type: string
+      enum: [delivered, bounced, complained]
+    SuppressionReason:
+      type: string
+      enum: [hard_bounce, complaint, manual]
+    ErrorCode:
+      type: string
+      enum:
+        - unauthorized
+        - app_disabled
+        - scene_not_found
+        - scene_disabled
+        - message_not_found
+        - webhook_disabled
+        - missing_idempotency_key
+        - invalid_idempotency_key
+        - request_too_large
+        - unsupported_media_type
+        - invalid_json
+        - invalid_query
+        - invalid_recipient
+        - invalid_context
+        - invalid_locale
+        - invalid_template_vars
+        - missing_template_var
+        - template_locale_not_found
+        - template_render_failed
+        - rate_limited
+        - suppressed_recipient
+        - idempotency_conflict
+        - route_not_found
+        - provider_unavailable
+        - queue_full
+        - internal_error

@@ -1,0 +1,10 @@
+.gocache/
+data/
+bin/
+config.yaml
+config.local.yaml
+*.test
+*.out
+coverage.out
+/muxmail
+/muxmail.exe
