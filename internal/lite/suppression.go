@@ -197,8 +197,8 @@ func (s *SuppressionStore) persistLocked() error {
 		return nil
 	}
 
-	if err := os.MkdirAll(filepath.Dir(s.path), directoryPerm); err != nil {
-		return fmt.Errorf("create suppression directory: %w", err)
+	if err := ensureDirectory(filepath.Dir(s.path)); err != nil {
+		return fmt.Errorf("prepare suppression directory: %w", err)
 	}
 
 	keys := make([]string, 0, len(s.entries))

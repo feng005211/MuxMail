@@ -29,8 +29,8 @@ func newJSONLWriter(path string, maxBytes int64, maxBackups int) (*jsonlWriter, 
 	if maxBackups < 1 {
 		return nil, fmt.Errorf("max backups must be at least 1")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), directoryPerm); err != nil {
-		return nil, fmt.Errorf("create log directory: %w", err)
+	if err := ensureDirectory(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("prepare log directory: %w", err)
 	}
 
 	writer := &jsonlWriter{
@@ -135,6 +135,17 @@ func (w *jsonlWriter) rotate() error {
 	}
 
 	return w.open()
+}
+
+func ensureDirectory(path string) error {
+	if err := os.MkdirAll(path, directoryPerm); err != nil {
+		return fmt.Errorf("create directory: %w", err)
+	}
+	if err := os.Chmod(path, directoryPerm); err != nil {
+		return fmt.Errorf("set directory permissions: %w", err)
+	}
+
+	return nil
 }
 
 func appendJSONField(line *[]byte, name string, value string, first bool) {
