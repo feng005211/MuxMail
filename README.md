@@ -17,6 +17,8 @@ The MVP is intentionally lightweight: one process, one container, file-based con
 - JSONL message, attempt, event, and optional stats logs.
 - `muxmail config validate` and `muxmail send dry-run`.
 
+Supported providers, daily/monthly quota notes, and public pricing references are listed in [docs/provider-support.md](docs/provider-support.md).
+
 ## Non-Goals For MVP
 
 - No Tenant model.

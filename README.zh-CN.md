@@ -17,6 +17,8 @@ MuxMail 是一个自托管的事务邮件路由网关，面向验证码、找回
 - JSONL 消息日志、尝试日志、事件日志和可选统计日志。
 - `muxmail config validate` 与 `muxmail send dry-run` 命令。
 
+已接入平台、每日/月度额度和公开价格来源见 [docs/provider-support.md](docs/provider-support.md)。
+
 ## MVP 非目标
 
 - 不做 Tenant 模型。

@@ -471,6 +471,8 @@ Brevo 原生 Webhook 使用配置中的 Bearer Token。
 
 ## 11. Provider 侧建议
 
+已接入平台、每日额度、月度额度和公开价格来源统一维护在 [接入平台支持矩阵](provider-support.md)。上线前必须重新核对服务商官网和控制台，因为额度和价格可能随地区、币种、账号状态和服务商策略变化。
+
 当前 MVP 不主动启用打开追踪和点击追踪。建议在 Brevo 和 Resend 后台也关闭默认的 open/click tracking，避免和事务邮件场景混在一起。
 
 同时建议：

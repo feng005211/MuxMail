@@ -438,6 +438,8 @@ transport: api、smtp。
 provider 第一阶段允许值：mock、resend、brevo。
 ```
 
+第一阶段已接入平台、Transport、每日额度、月度额度和公开价格来源统一维护在 [provider-support.md](provider-support.md)。该矩阵只记录当前代码已接入平台，不把后续设计候选平台标记为已支持。
+
 日志禁止记录完整 API Key、Provider Secret、验证码、重置 token、完整模板变量和完整收件人邮箱地址。
 
 `to_hash` 规则固定为：
