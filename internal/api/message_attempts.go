@@ -29,6 +29,7 @@ type messageAttemptResponseEntry struct {
 	Status            domain.AttemptStatus `json:"status"`
 	FailureClass      domain.FailureClass  `json:"failure_class,omitempty"`
 	ErrorCode         domain.ErrorCode     `json:"error_code,omitempty"`
+	ErrorMessage      string               `json:"error_message,omitempty"`
 	ProviderMessageID string               `json:"provider_message_id,omitempty"`
 	DurationMS        int                  `json:"duration_ms"`
 }
@@ -74,7 +75,7 @@ func (r *Runtime) processMessageAttempts(httpRequest *http.Request) (messageAtte
 		return messageAttemptsResponse{}, APIError{Code: domain.ErrorCodeMessageNotFound, Message: "message not found"}
 	}
 
-	attempts, err := r.messageLog.ListAttempts(messageID)
+	attempts, err := r.messageLog.ListAttempts(auth.App.Code, messageID)
 	if err != nil {
 		return messageAttemptsResponse{}, fmt.Errorf("list message attempts: %w", err)
 	}
@@ -107,6 +108,7 @@ func messageAttemptsFromSnapshots(snapshot lite.MessageSnapshot, attempts []lite
 			Status:            attempt.Status,
 			FailureClass:      attempt.FailureClass,
 			ErrorCode:         attempt.ErrorCode,
+			ErrorMessage:      attempt.ErrorMessage,
 			ProviderMessageID: attempt.ProviderMessageID,
 			DurationMS:        attempt.DurationMS,
 		})

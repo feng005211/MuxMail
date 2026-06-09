@@ -80,6 +80,11 @@ func TestSelectRouteInvalidRecipientDomain(t *testing.T) {
 	assertRouteErrorCode(t, err, ErrorCodeRouteNotFound)
 }
 
+func TestSelectRouteRejectsMalformedRecipientEvenWithFallback(t *testing.T) {
+	_, err := SelectRoute(routeScene(), "user@bad domain", 3)
+	assertRouteErrorCode(t, err, ErrorCodeRouteNotFound)
+}
+
 func TestRecipientDomainLowercasesDomain(t *testing.T) {
 	domain, ok := RecipientDomain("user@Gmail.COM")
 	if !ok {

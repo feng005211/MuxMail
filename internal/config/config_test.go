@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -66,6 +67,26 @@ func TestLoadFileAppliesDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadFileDefaultsRetryBackoffToConfiguredMaxAttempts(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeTestConfig(t, configPath, `
+defaults:
+  max_attempts_per_message: 2
+apps: []
+`)
+
+	cfg, err := LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("expected config to load: %v", err)
+	}
+
+	got := cfg.Defaults.RetryBackoffSeconds
+	if len(got) != 2 || got[0] != 0 || got[1] != 30 {
+		t.Fatalf("expected default retry backoff [0 30], got %v", got)
+	}
+}
+
 func TestLoadFileFailsOnMissingFile(t *testing.T) {
 	_, err := LoadFile(filepath.Join(t.TempDir(), "missing.yaml"))
 	if err == nil {
@@ -77,6 +98,52 @@ func TestLoadFileRequiresPath(t *testing.T) {
 	_, err := LoadFile("")
 	if err == nil {
 		t.Fatal("expected empty config path to fail")
+	}
+}
+
+func TestLoadFileRejectsUnknownTopLevelField(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeTestConfig(t, configPath, "apps: []\nunknown_field: true\n")
+
+	_, err := LoadFile(configPath)
+	if err == nil {
+		t.Fatal("expected unknown top-level field to fail")
+	}
+	if !strings.Contains(err.Error(), "unknown_field") {
+		t.Fatalf("expected unknown field in error, got %v", err)
+	}
+}
+
+func TestLoadFileRejectsUnknownNestedField(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeTestConfig(t, configPath, `
+defaults:
+  max_request_body_bytez: 65536
+apps: []
+`)
+
+	_, err := LoadFile(configPath)
+	if err == nil {
+		t.Fatal("expected unknown nested field to fail")
+	}
+	if !strings.Contains(err.Error(), "max_request_body_bytez") {
+		t.Fatalf("expected unknown nested field in error, got %v", err)
+	}
+}
+
+func TestLoadFileRejectsMultipleYAMLDocuments(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeTestConfig(t, configPath, "apps: []\n---\nruntime:\n  stats: file\n")
+
+	_, err := LoadFile(configPath)
+	if err == nil {
+		t.Fatal("expected multiple YAML documents to fail")
+	}
+	if !strings.Contains(err.Error(), "single YAML document") {
+		t.Fatalf("expected single document error, got %v", err)
 	}
 }
 

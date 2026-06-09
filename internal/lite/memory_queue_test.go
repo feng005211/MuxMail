@@ -45,6 +45,66 @@ func TestMemoryQueueFull(t *testing.T) {
 	assertQueueFull(t, err)
 }
 
+func TestMemoryQueueReservationHoldsCapacityUntilCommit(t *testing.T) {
+	queue := openTestMemoryQueue(t, 1, fixedQueueTime)
+
+	reservation, err := queue.Reserve()
+	if err != nil {
+		t.Fatalf("reserve capacity: %v", err)
+	}
+	if got := queue.PendingCount(); got != 1 {
+		t.Fatalf("expected reservation to count toward capacity, got %d", got)
+	}
+	assertQueueFull(t, queue.Enqueue(testQueueTask("msg_2")))
+
+	if err := reservation.Commit(testQueueTask("msg_1")); err != nil {
+		t.Fatalf("commit reservation: %v", err)
+	}
+	task, err := queue.Dequeue(context.Background())
+	if err != nil {
+		t.Fatalf("dequeue committed task: %v", err)
+	}
+	if task.Message.MessageID != "msg_1" {
+		t.Fatalf("unexpected committed task: %+v", task)
+	}
+}
+
+func TestMemoryQueueReservationReleaseReturnsCapacity(t *testing.T) {
+	queue := openTestMemoryQueue(t, 1, fixedQueueTime)
+
+	reservation, err := queue.Reserve()
+	if err != nil {
+		t.Fatalf("reserve capacity: %v", err)
+	}
+	reservation.Release()
+	if got := queue.PendingCount(); got != 0 {
+		t.Fatalf("expected release to return capacity, got %d", got)
+	}
+	if err := queue.Enqueue(testQueueTask("msg_1")); err != nil {
+		t.Fatalf("enqueue after release: %v", err)
+	}
+}
+
+func TestMemoryQueueReservationCommitAfterCloseDoesNotUnderflowPending(t *testing.T) {
+	queue := openTestMemoryQueue(t, 1, fixedQueueTime)
+
+	reservation, err := queue.Reserve()
+	if err != nil {
+		t.Fatalf("reserve capacity: %v", err)
+	}
+	if err := queue.Close(); err != nil {
+		t.Fatalf("close queue: %v", err)
+	}
+
+	err = reservation.Commit(testQueueTask("msg_1"))
+	if !errors.Is(err, ErrMemoryQueueClosed) {
+		t.Fatalf("expected closed queue error, got %v", err)
+	}
+	if got := queue.PendingCount(); got != 0 {
+		t.Fatalf("expected pending count to remain zero after close, got %d", got)
+	}
+}
+
 func TestMemoryQueueDelayedRetryCountsTowardCapacity(t *testing.T) {
 	queue := openTestMemoryQueue(t, 1, fixedQueueTime)
 

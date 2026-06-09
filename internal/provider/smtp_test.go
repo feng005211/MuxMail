@@ -82,6 +82,64 @@ func TestSMTPTransportSendsMultipartAlternativeMIME(t *testing.T) {
 	}
 }
 
+func TestSMTPTransportDoesNotEmitInjectedHeaders(t *testing.T) {
+	server := newTestSMTPServer(t, testSMTPServerConfig{})
+	defer server.close()
+
+	message := testSMTPMessage("text")
+	message.Subject = "Your code\r\nBcc: attacker@example.com"
+	result := sendThroughTestSMTP(t, server, message)
+	if !result.IsAccepted() {
+		t.Fatalf("expected accepted SMTP result, got %+v", result)
+	}
+
+	data := server.messageData()
+	if strings.Contains(data, "\r\nBcc:") || strings.Contains(data, "\nBcc:") {
+		t.Fatalf("unexpected injected header in MIME data:\n%s", data)
+	}
+}
+
+func TestSMTPTransportRejectsInvalidFromNameBeforeSMTP(t *testing.T) {
+	server := newTestSMTPServer(t, testSMTPServerConfig{})
+	defer server.close()
+
+	result := sendThroughTestSMTPWithSecrets(
+		t,
+		server,
+		testSMTPMessage("text"),
+		StaticSecretResolver{"smtp_password": "secret"},
+		func(request *SendRequest) {
+			request.Channel.FromName = "MuxMail\r\nBcc: attacker@example.com"
+		},
+	)
+
+	if !result.IsFailed() || result.Failed.FailureClass != domain.FailureClassChannel {
+		t.Fatalf("expected invalid from name channel failure, got %+v", result)
+	}
+	if data := server.messageData(); data != "" {
+		t.Fatalf("expected invalid from name to stop before SMTP DATA, got:\n%s", data)
+	}
+}
+
+func TestSMTPTransportRejectsInvalidRecipientBeforeSMTP(t *testing.T) {
+	server := newTestSMTPServer(t, testSMTPServerConfig{})
+	defer server.close()
+
+	message := testSMTPMessage("text")
+	message.ToEmail = "victim@example.com\r\nBcc: attacker@example.com"
+	result := sendThroughTestSMTP(t, server, message)
+
+	if !result.IsFailed() || result.Failed.FailureClass != domain.FailureClassMessagePermanent {
+		t.Fatalf("expected invalid recipient permanent failure, got %+v", result)
+	}
+	if result.Failed.ErrorCode != domain.ErrorCodeInvalidRecipient {
+		t.Fatalf("expected invalid_recipient error code, got %+v", result.Failed.ErrorCode)
+	}
+	if data := server.messageData(); data != "" {
+		t.Fatalf("expected invalid recipient to stop before SMTP DATA, got:\n%s", data)
+	}
+}
+
 func TestSMTPTransportClassifies4xxAsTemporaryFailure(t *testing.T) {
 	server := newTestSMTPServer(t, testSMTPServerConfig{rcptResponse: "451 try later"})
 	defer server.close()
@@ -89,6 +147,16 @@ func TestSMTPTransportClassifies4xxAsTemporaryFailure(t *testing.T) {
 	result := sendThroughTestSMTP(t, server, testSMTPMessage("text"))
 	if !result.IsFailed() || result.Failed.FailureClass != domain.FailureClassTemporary {
 		t.Fatalf("expected temporary failure, got %+v", result)
+	}
+}
+
+func TestSMTPTransportClassifies5xxGreetingAsChannelFailure(t *testing.T) {
+	server := newTestSMTPServer(t, testSMTPServerConfig{greetingResponse: "554 service rejected"})
+	defer server.close()
+
+	result := sendThroughTestSMTP(t, server, testSMTPMessage("text"))
+	if !result.IsFailed() || result.Failed.FailureClass != domain.FailureClassChannel {
+		t.Fatalf("expected channel failure, got %+v", result)
 	}
 }
 
@@ -134,6 +202,55 @@ func TestSMTPTransportUsesAccountAPIKeyFallback(t *testing.T) {
 	}
 }
 
+func TestSMTPTransportHonorsDeadlineBeforeServerGreeting(t *testing.T) {
+	serverConn := make(chan net.Conn, 1)
+	transport := NewSMTPTransport(
+		StaticSecretResolver{"smtp_password": "secret"},
+		WithoutSMTPPortRequirement(),
+		WithSMTPDialer(func(ctx context.Context, network string, address string) (net.Conn, error) {
+			client, server := net.Pipe()
+			serverConn <- server
+			return client, nil
+		}),
+	)
+	request := testSMTPSendRequest(testSMTPMessage("text"))
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	type outcome struct {
+		result SendResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := transport.Send(ctx, request)
+		done <- outcome{result: result, err: err}
+	}()
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("smtp send returned error: %v", result.err)
+		}
+		if !result.result.IsFailed() || result.result.Failed.FailureClass != domain.FailureClassTemporary {
+			t.Fatalf("expected missing greeting to be a temporary failure, got %+v", result.result)
+		}
+	case <-time.After(750 * time.Millisecond):
+		select {
+		case conn := <-serverConn:
+			_ = conn.Close()
+		default:
+		}
+		t.Fatal("expected SMTP greeting read to honor context deadline")
+	}
+
+	select {
+	case conn := <-serverConn:
+		_ = conn.Close()
+	default:
+	}
+}
+
 func sendThroughTestSMTP(t *testing.T, server *testSMTPServer, message domain.Message) SendResult {
 	t.Helper()
 
@@ -154,7 +271,22 @@ func sendThroughTestSMTPWithSecrets(t *testing.T, server *testSMTPServer, messag
 		WithoutSMTPPortRequirement(),
 		WithSMTPTLSConfig(&tls.Config{InsecureSkipVerify: true, ServerName: "localhost"}),
 	)
-	request := SendRequest{
+	request := testSMTPSendRequest(message)
+	request.Channel.SMTP.Port = port
+	for _, option := range options {
+		option(&request)
+	}
+
+	result, err := transport.Send(context.Background(), request)
+	if err != nil {
+		t.Fatalf("smtp send returned error: %v", err)
+	}
+
+	return result
+}
+
+func testSMTPSendRequest(message domain.Message) SendRequest {
+	return SendRequest{
 		Message: message,
 		Account: domain.ProviderAccount{
 			Code:           "resend_main",
@@ -171,22 +303,12 @@ func sendThroughTestSMTPWithSecrets(t *testing.T, server *testSMTPServer, messag
 			From:      "no-reply@example.com",
 			SMTP: &domain.SMTPSettings{
 				Host:        "127.0.0.1",
-				Port:        port,
+				Port:        587,
 				Username:    "resend",
 				PasswordRef: "smtp_password",
 			},
 		},
 	}
-	for _, option := range options {
-		option(&request)
-	}
-
-	result, err := transport.Send(context.Background(), request)
-	if err != nil {
-		t.Fatalf("smtp send returned error: %v", err)
-	}
-
-	return result
 }
 
 func testSMTPMessage(kind string) domain.Message {
@@ -211,8 +333,9 @@ func testSMTPMessage(kind string) domain.Message {
 }
 
 type testSMTPServerConfig struct {
-	authResponse string
-	rcptResponse string
+	greetingResponse string
+	authResponse     string
+	rcptResponse     string
 }
 
 type testSMTPServer struct {
@@ -270,7 +393,11 @@ func (s *testSMTPServer) serve() {
 
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
-	writeSMTPLine(writer, "220 localhost ESMTP")
+	greetingResponse := s.config.greetingResponse
+	if greetingResponse == "" {
+		greetingResponse = "220 localhost ESMTP"
+	}
+	writeSMTPLine(writer, greetingResponse)
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {

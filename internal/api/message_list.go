@@ -14,6 +14,7 @@ import (
 const (
 	defaultMessageListLimit = 50
 	maxMessageListLimit     = 200
+	maxSceneFilterBytes     = 64
 )
 
 type messageListResponse struct {
@@ -91,10 +92,34 @@ func parseMessageListFilter(httpRequest *http.Request) (lite.MessageListFilter, 
 	}
 
 	scene := strings.TrimSpace(query.Get("scene"))
+	if scene != "" && !isValidIdentifierFilter(scene) {
+		return lite.MessageListFilter{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidQuery, Message: "scene is invalid"}
+	}
 
 	return lite.MessageListFilter{
 		Limit:  limit,
 		Status: status,
 		Scene:  scene,
 	}, nil
+}
+
+func isValidIdentifierFilter(value string) bool {
+	if value == "" || len(value) > maxSceneFilterBytes {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		valid := (char >= 'a' && char <= 'z') ||
+			(char >= '0' && char <= '9') ||
+			char == '_' ||
+			char == '-'
+		if !valid {
+			return false
+		}
+		if (index == 0 || index == len(value)-1) && !(char >= 'a' && char <= 'z') && !(char >= '0' && char <= '9') {
+			return false
+		}
+	}
+
+	return true
 }

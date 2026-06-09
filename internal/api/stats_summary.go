@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/muxmail/muxmail/internal/domain"
@@ -72,6 +73,7 @@ func (r *Runtime) processStatsSummary(httpRequest *http.Request) (statsSummaryRe
 }
 
 func parseStatsWindow(value string) (string, time.Duration, error) {
+	value = strings.TrimSpace(value)
 	if value == "" {
 		value = "24h"
 	}

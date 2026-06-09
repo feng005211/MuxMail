@@ -1,5 +1,6 @@
 .git
 .gocache
+.npm-cache
 .qodo
 bin
 data
@@ -10,3 +11,8 @@ config.local.yaml
 coverage.out
 muxmail
 muxmail.exe
+web/admin/node_modules
+web/admin/dist
+web/admin/*.tsbuildinfo
+web/admin/vite.config.js
+web/admin/vite.config.d.ts

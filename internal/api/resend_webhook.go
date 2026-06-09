@@ -121,7 +121,12 @@ func (v resendWebhookVerifier) verify(header http.Header, body []byte) error {
 		return AuthError{Code: domain.ErrorCodeUnauthorized, Message: "unauthorized"}
 	}
 	signedAt := time.Unix(seconds, 0)
-	if signedAt.Before(v.now().Add(-resendWebhookTolerance)) || signedAt.After(v.now().Add(resendWebhookTolerance)) {
+	now := time.Now
+	if v.now != nil {
+		now = v.now
+	}
+	verifiedAt := now()
+	if signedAt.Before(verifiedAt.Add(-resendWebhookTolerance)) || signedAt.After(verifiedAt.Add(resendWebhookTolerance)) {
 		return AuthError{Code: domain.ErrorCodeUnauthorized, Message: "unauthorized"}
 	}
 
@@ -129,11 +134,7 @@ func (v resendWebhookVerifier) verify(header http.Header, body []byte) error {
 	mac := hmac.New(sha256.New, v.secret)
 	_, _ = mac.Write([]byte(signedPayload))
 	expected := mac.Sum(nil)
-	for _, part := range strings.Fields(signature) {
-		version, encoded, ok := strings.Cut(part, ",")
-		if !ok || version != "v1" {
-			continue
-		}
+	for _, encoded := range svixV1SignatureValues(signature) {
 		actual, err := base64.StdEncoding.DecodeString(encoded)
 		if err != nil {
 			continue
@@ -144,6 +145,18 @@ func (v resendWebhookVerifier) verify(header http.Header, body []byte) error {
 	}
 
 	return AuthError{Code: domain.ErrorCodeUnauthorized, Message: "unauthorized"}
+}
+
+func svixV1SignatureValues(header string) []string {
+	tokens := strings.Fields(strings.ReplaceAll(header, ",", " "))
+	values := make([]string, 0, len(tokens)/2)
+	for index := 0; index+1 < len(tokens); index++ {
+		if tokens[index] == "v1" {
+			values = append(values, tokens[index+1])
+		}
+	}
+
+	return values
 }
 
 func decodeSvixSecret(value string) ([]byte, error) {
@@ -195,8 +208,17 @@ func decodeResendWebhookEvent(body []byte) (domain.ProviderEvent, error) {
 	if event.AppCode == "" || event.MessageID == "" {
 		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "app and message_id tags are required"}
 	}
-	if requiresSuppression(event.EventType) && domain.NormalizeEmail(event.RecipientEmail) == "" {
-		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "recipient email is required for bounce and complaint events"}
+	if !isValidIdentifierFilter(event.AppCode) {
+		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "app is invalid"}
+	}
+	if !isValidMessageIDValue(event.MessageID) {
+		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "message_id is invalid"}
+	}
+	if err := validateProviderEventIdentity(&event); err != nil {
+		return domain.ProviderEvent{}, err
+	}
+	if err := validateProviderEventRecipientEmail(event); err != nil {
+		return domain.ProviderEvent{}, err
 	}
 
 	return event, nil

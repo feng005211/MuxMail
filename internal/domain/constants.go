@@ -178,6 +178,27 @@ func SupportsTransport(provider Provider, transport Transport) bool {
 	}
 }
 
+const (
+	// MinAPIKeyBytes is the minimum accepted byte length for an App API key.
+	MinAPIKeyBytes = 24
+	// MaxAPIKeyBytes is the maximum accepted byte length for an App API key.
+	MaxAPIKeyBytes = 128
+)
+
+// IsValidAPIKeyValue reports whether value can be used as an App API key.
+func IsValidAPIKeyValue(value string) bool {
+	if len(value) < MinAPIKeyBytes || len(value) > MaxAPIKeyBytes {
+		return false
+	}
+	for _, char := range value {
+		if char < 0x21 || char > 0x7E {
+			return false
+		}
+	}
+
+	return true
+}
+
 // ErrorCode is a stable public API error code returned by MuxMail.
 type ErrorCode string
 

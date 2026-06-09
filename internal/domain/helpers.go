@@ -36,6 +36,22 @@ func NormalizeEmail(email string) string {
 	return strings.ToLower(email)
 }
 
+// IsSafeEmailHeaderValue reports whether a value can be used in email headers.
+func IsSafeEmailHeaderValue(value string) bool {
+	for _, char := range value {
+		if char < 0x20 || char == 0x7f {
+			return false
+		}
+	}
+
+	return true
+}
+
+// IsSafeEmailDisplayName reports whether a display name can be used in provider payloads.
+func IsSafeEmailDisplayName(value string) bool {
+	return IsSafeEmailHeaderValue(value)
+}
+
 // ToHash returns sha256(app + ":" + normalizedToEmail) as lowercase hex.
 func ToHash(app string, normalizedToEmail string) string {
 	return sha256Hex(app + ":" + normalizedToEmail)
@@ -176,12 +192,177 @@ func writeCanonicalValue(builder *strings.Builder, value any) error {
 	case float64:
 		builder.WriteString(strconv.FormatFloat(typed, 'g', -1, 64))
 	case json.Number:
-		builder.WriteString(typed.String())
+		canonical, err := canonicalJSONNumber(typed)
+		if err != nil {
+			return err
+		}
+		builder.WriteString(canonical)
 	default:
 		return fmt.Errorf("unsupported value type %T", value)
 	}
 
 	return nil
+}
+
+func canonicalJSONNumber(number json.Number) (string, error) {
+	source := number.String()
+	index := 0
+	negative := false
+	if index < len(source) && source[index] == '-' {
+		negative = true
+		index++
+	}
+	if index >= len(source) {
+		return "", fmt.Errorf("invalid JSON number %q", source)
+	}
+
+	integerStart := index
+	switch {
+	case source[index] == '0':
+		index++
+		if index < len(source) && isDecimalDigit(source[index]) {
+			return "", fmt.Errorf("invalid JSON number %q", source)
+		}
+	case source[index] >= '1' && source[index] <= '9':
+		for index < len(source) && isDecimalDigit(source[index]) {
+			index++
+		}
+	default:
+		return "", fmt.Errorf("invalid JSON number %q", source)
+	}
+	integerPart := source[integerStart:index]
+
+	fractionPart := ""
+	if index < len(source) && source[index] == '.' {
+		index++
+		fractionStart := index
+		for index < len(source) && isDecimalDigit(source[index]) {
+			index++
+		}
+		if fractionStart == index {
+			return "", fmt.Errorf("invalid JSON number %q", source)
+		}
+		fractionPart = source[fractionStart:index]
+	}
+
+	exponent := big.NewInt(-int64(len(fractionPart)))
+	if index < len(source) && (source[index] == 'e' || source[index] == 'E') {
+		index++
+		exponentNegative := false
+		if index < len(source) && (source[index] == '+' || source[index] == '-') {
+			exponentNegative = source[index] == '-'
+			index++
+		}
+		exponentStart := index
+		for index < len(source) && isDecimalDigit(source[index]) {
+			index++
+		}
+		if exponentStart == index {
+			return "", fmt.Errorf("invalid JSON number %q", source)
+		}
+		parsedExponent, ok := new(big.Int).SetString(source[exponentStart:index], 10)
+		if !ok {
+			return "", fmt.Errorf("invalid JSON number %q", source)
+		}
+		if exponentNegative {
+			parsedExponent.Neg(parsedExponent)
+		}
+		exponent.Add(exponent, parsedExponent)
+	}
+	if index != len(source) {
+		return "", fmt.Errorf("invalid JSON number %q", source)
+	}
+
+	digits := strings.TrimLeft(integerPart+fractionPart, "0")
+	if digits == "" {
+		return "0", nil
+	}
+	for exponent.Sign() < 0 && strings.HasSuffix(digits, "0") {
+		digits = digits[:len(digits)-1]
+		exponent.Add(exponent, big.NewInt(1))
+	}
+
+	var builder strings.Builder
+	if negative {
+		builder.WriteByte('-')
+	}
+
+	switch exponent.Sign() {
+	case 1:
+		_, normalizedExponent := canonicalScientificParts(digits, exponent)
+		if _, ok := boundedBigIntToInt(normalizedExponent, defaultMaxTemplateVarBytes); !ok {
+			builder.WriteString(canonicalScientificNumber(digits, exponent))
+			return builder.String(), nil
+		}
+		padding, ok := boundedBigIntToInt(exponent, defaultMaxTemplateVarBytes)
+		if !ok {
+			builder.WriteString(canonicalScientificNumber(digits, exponent))
+			return builder.String(), nil
+		}
+		builder.WriteString(digits)
+		builder.WriteString(strings.Repeat("0", padding))
+	case 0:
+		builder.WriteString(digits)
+	case -1:
+		placesBig := new(big.Int).Neg(exponent)
+		places, ok := boundedBigIntToInt(placesBig, defaultMaxTemplateVarBytes+len(digits))
+		if !ok {
+			builder.WriteString(canonicalScientificNumber(digits, exponent))
+			return builder.String(), nil
+		}
+		if places < len(digits) {
+			split := len(digits) - places
+			builder.WriteString(digits[:split])
+			builder.WriteByte('.')
+			builder.WriteString(digits[split:])
+			return builder.String(), nil
+		}
+		padding := places - len(digits)
+		if padding > defaultMaxTemplateVarBytes {
+			builder.WriteString(canonicalScientificNumber(digits, exponent))
+			return builder.String(), nil
+		}
+		builder.WriteString("0.")
+		builder.WriteString(strings.Repeat("0", padding))
+		builder.WriteString(digits)
+	}
+
+	return builder.String(), nil
+}
+
+func canonicalScientificNumber(digits string, exponent *big.Int) string {
+	digits, exponent = canonicalScientificParts(digits, exponent)
+	if exponent.Sign() == 0 {
+		return digits
+	}
+
+	return digits + "e" + exponent.String()
+}
+
+func canonicalScientificParts(digits string, exponent *big.Int) (string, *big.Int) {
+	exponent = new(big.Int).Set(exponent)
+	for strings.HasSuffix(digits, "0") {
+		digits = digits[:len(digits)-1]
+		exponent.Add(exponent, big.NewInt(1))
+	}
+
+	return digits, exponent
+}
+
+func boundedBigIntToInt(value *big.Int, max int) (int, bool) {
+	if value.Sign() < 0 || value.BitLen() > 63 {
+		return 0, false
+	}
+	int64Value := value.Int64()
+	if int64Value > int64(max) {
+		return 0, false
+	}
+
+	return int(int64Value), true
+}
+
+func isDecimalDigit(char byte) bool {
+	return char >= '0' && char <= '9'
 }
 
 func writeJSONString(builder *strings.Builder, value string) {

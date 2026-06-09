@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/muxmail/muxmail/internal/config"
 	"github.com/muxmail/muxmail/internal/domain"
@@ -13,7 +14,7 @@ type webhookAuthenticator struct {
 }
 
 func newWebhookAuthenticator(webhooks config.WebhookConfig, resolver config.SecretResolver) (webhookAuthenticator, error) {
-	if !webhooks.Enabled {
+	if !webhooks.Enabled || strings.TrimSpace(webhooks.SharedSecretRef) == "" {
 		return webhookAuthenticator{}, nil
 	}
 	if resolver == nil {

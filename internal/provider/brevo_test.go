@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/muxmail/muxmail/internal/domain"
 )
@@ -50,6 +51,21 @@ func TestBrevoAPIProviderAcceptedResponse(t *testing.T) {
 	assertBrevoTag(t, captured.Tags, "provider_channel:brevo_auth_api")
 }
 
+func TestBrevoAPIProviderTreats2xxWithoutMessageIDAsAccepted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	result := sendThroughBrevoTestServer(t, server, brevoTestMessage(), nil)
+	if !result.IsAccepted() {
+		t.Fatalf("expected accepted response, got %+v", result)
+	}
+	if result.Accepted.ProviderMessageID != "" {
+		t.Fatalf("expected empty provider message id, got %q", result.Accepted.ProviderMessageID)
+	}
+}
+
 func TestBrevoAPIProviderMaps429ToTemporaryFailure(t *testing.T) {
 	server := brevoErrorServer(http.StatusTooManyRequests, "too_many_requests", "slow down", "90")
 	defer server.Close()
@@ -58,6 +74,29 @@ func TestBrevoAPIProviderMaps429ToTemporaryFailure(t *testing.T) {
 	assertBrevoFailure(t, result, domain.FailureClassTemporary, domain.ErrorCodeProviderUnavailable)
 	if result.RetryAfterSeconds != 90 {
 		t.Fatalf("expected retry-after 90, got %d", result.RetryAfterSeconds)
+	}
+}
+
+func TestBrevoAPIProviderMapsHTTPDateRetryAfter(t *testing.T) {
+	now := time.Date(2026, 6, 9, 12, 30, 0, 0, time.UTC)
+	retryAfter := now.Add(2 * time.Second).Format(http.TimeFormat)
+	server := brevoErrorServer(http.StatusTooManyRequests, "too_many_requests", "slow down", retryAfter)
+	defer server.Close()
+
+	provider := NewBrevoAPIProvider(
+		StaticSecretResolver{"brevo_key": "secret"},
+		WithBrevoBaseURL(server.URL),
+		WithBrevoHTTPClient(server.Client()),
+		WithBrevoNow(func() time.Time { return now }),
+	)
+	result, err := provider.Send(context.Background(), brevoTestRequest(brevoTestMessage()))
+	if err != nil {
+		t.Fatalf("brevo send returned error: %v", err)
+	}
+
+	assertBrevoFailure(t, result, domain.FailureClassTemporary, domain.ErrorCodeProviderUnavailable)
+	if result.RetryAfterSeconds != 2 {
+		t.Fatalf("expected retry-after 2, got %d", result.RetryAfterSeconds)
 	}
 }
 
@@ -101,8 +140,77 @@ func TestBrevoAPIProviderMapsAuthFailureToChannelFailure(t *testing.T) {
 	assertBrevoFailure(t, result, domain.FailureClassChannel, domain.ErrorCodeProviderUnavailable)
 }
 
+func TestBrevoAPIProviderRejectsInvalidAPIKeyValueBeforeRequest(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"messageId":"brevo_msg_123"}`))
+	}))
+	defer server.Close()
+
+	result, err := NewBrevoAPIProvider(
+		StaticSecretResolver{"brevo_key": "secret\n"},
+		WithBrevoBaseURL(server.URL),
+		WithBrevoHTTPClient(server.Client()),
+	).Send(context.Background(), brevoTestRequest(brevoTestMessage()))
+	if err != nil {
+		t.Fatalf("brevo send returned error: %v", err)
+	}
+	assertBrevoFailure(t, result, domain.FailureClassChannel, domain.ErrorCodeProviderUnavailable)
+	if requestCount != 0 {
+		t.Fatalf("expected invalid api key to stop before HTTP request, got %d requests", requestCount)
+	}
+}
+
+func TestBrevoAPIProviderRejectsInvalidRecipientBeforeRequest(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"messageId":"brevo_msg_123"}`))
+	}))
+	defer server.Close()
+
+	message := brevoTestMessage()
+	message.ToEmail = "victim@example.com\r\nBcc: attacker@example.com"
+	result := sendThroughBrevoTestServer(t, server, message, nil)
+
+	assertBrevoFailure(t, result, domain.FailureClassMessagePermanent, domain.ErrorCodeInvalidRecipient)
+	if requestCount != 0 {
+		t.Fatalf("expected invalid recipient to stop before HTTP request, got %d requests", requestCount)
+	}
+}
+
+func TestBrevoAPIProviderRejectsInvalidFromNameBeforeRequest(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"messageId":"brevo_msg_123"}`))
+	}))
+	defer server.Close()
+
+	result := sendThroughBrevoTestServer(t, server, brevoTestMessage(), func(request *SendRequest) {
+		request.Channel.FromName = "MuxMail\r\nBcc: attacker@example.com"
+	})
+
+	assertBrevoFailure(t, result, domain.FailureClassChannel, domain.ErrorCodeProviderUnavailable)
+	if requestCount != 0 {
+		t.Fatalf("expected invalid from name to stop before HTTP request, got %d requests", requestCount)
+	}
+}
+
 func TestBrevoAPIProviderMapsDomainFailureToChannelFailure(t *testing.T) {
 	server := brevoErrorServer(http.StatusBadRequest, "invalid_parameter", "sender domain is not verified", "")
+	defer server.Close()
+
+	result := sendThroughBrevoTestServer(t, server, brevoTestMessage(), nil)
+	assertBrevoFailure(t, result, domain.FailureClassChannel, domain.ErrorCodeProviderUnavailable)
+}
+
+func TestBrevoAPIProviderMapsSenderFailureToChannelFailure(t *testing.T) {
+	server := brevoErrorServer(http.StatusBadRequest, "invalid_parameter", "invalid sender address", "")
 	defer server.Close()
 
 	result := sendThroughBrevoTestServer(t, server, brevoTestMessage(), nil)

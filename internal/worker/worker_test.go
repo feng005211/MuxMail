@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/muxmail/muxmail/internal/domain"
 	"github.com/muxmail/muxmail/internal/lite"
@@ -72,6 +73,31 @@ func TestWorkerTemporaryFailureThenSuccess(t *testing.T) {
 	assertRecordValue(t, messages[3], "status", string(domain.MessageStatusSent))
 }
 
+func TestWorkerRetryEnqueueFailureMarksMessageFailed(t *testing.T) {
+	harness := newWorkerHarnessWithQueueCapacity(t, 1, provider.TemporaryFailure(domain.ErrorCodeProviderUnavailable, "temporary provider failure"))
+	defer harness.close()
+
+	if err := harness.queue.Enqueue(lite.QueueTask{Message: testWorkerMessage(), AttemptNo: 1}); err != nil {
+		t.Fatalf("fill queue: %v", err)
+	}
+
+	err := harness.worker.ProcessTask(context.Background(), lite.QueueTask{Message: testWorkerMessage(), AttemptNo: 1})
+	if err == nil {
+		t.Fatal("expected retry enqueue failure")
+	}
+	if !strings.Contains(err.Error(), string(domain.ErrorCodeQueueFull)) {
+		t.Fatalf("expected queue full error, got %v", err)
+	}
+
+	messages := readJSONLLines(t, filepath.Join(harness.dir, "mail-messages.jsonl"))
+	if len(messages) != 3 {
+		t.Fatalf("expected sending retrying failed, got %d records", len(messages))
+	}
+	assertRecordValue(t, messages[1], "status", string(domain.MessageStatusRetrying))
+	assertRecordValue(t, messages[2], "status", string(domain.MessageStatusFailed))
+	assertRecordValue(t, messages[2], "error_code", string(domain.ErrorCodeQueueFull))
+}
+
 func TestWorkerChannelFailureThenSuccess(t *testing.T) {
 	harness := newWorkerHarness(t,
 		provider.ChannelFailure(domain.ErrorCodeProviderUnavailable, "channel failed"),
@@ -96,6 +122,248 @@ func TestWorkerChannelFailureThenSuccess(t *testing.T) {
 	}
 	if requests[0].Channel.Code != "mock_primary" || requests[1].Channel.Code != "mock_backup" {
 		t.Fatalf("expected failover from primary to backup, got %s then %s", requests[0].Channel.Code, requests[1].Channel.Code)
+	}
+}
+
+func TestWorkerAttemptStatsUseSelectedChannelCode(t *testing.T) {
+	now := time.Date(2026, 5, 28, 3, 4, 5, 0, time.UTC)
+	dir := t.TempDir()
+	log, err := lite.NewMessageLog(lite.MessageLogConfig{
+		Dir:        dir,
+		MaxBytes:   1 << 20,
+		MaxBackups: 2,
+		Now:        func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("open message log: %v", err)
+	}
+	defer log.Close()
+	queue, err := lite.NewMemoryQueue(lite.MemoryQueueConfig{Capacity: 10, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("open queue: %v", err)
+	}
+	defer queue.Close()
+	stats, err := lite.NewFileStatsSink(lite.FileStatsSinkConfig{
+		Dir:        dir,
+		MaxBytes:   1 << 20,
+		MaxBackups: 2,
+		Now:        func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("open stats sink: %v", err)
+	}
+	defer stats.Close()
+
+	account := domain.ProviderAccount{Code: "mock_main", Provider: domain.ProviderMock, Enabled: true}
+	fake := provider.NewFakeProvider(provider.Accepted("provider_stats"))
+	resolver := providerResolverFunc(func(channelCode string) (ProviderChannelRuntime, bool) {
+		if channelCode != "mock_primary" {
+			return ProviderChannelRuntime{}, false
+		}
+		return ProviderChannelRuntime{
+			Account: account,
+			Channel: domain.ProviderChannel{
+				Code:      "mock_primary",
+				Account:   "mock_main",
+				Transport: domain.TransportAPI,
+				Enabled:   true,
+			},
+			Provider: fake,
+		}, true
+	})
+	worker, err := New(Config{
+		Queue:                 queue,
+		MessageLog:            log,
+		Stats:                 stats,
+		ProviderResolver:      resolver,
+		MaxAttemptsPerMessage: 1,
+		RetryBackoffSeconds:   []int{0},
+		ProviderTimeout:       time.Second,
+		WorkerConcurrency:     1,
+		Now:                   func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("open worker: %v", err)
+	}
+
+	message := testWorkerMessage()
+	message.ProviderChannels = []string{"mock_primary"}
+	if err := worker.ProcessTask(context.Background(), lite.QueueTask{Message: message, AttemptNo: 1}); err != nil {
+		t.Fatalf("process task: %v", err)
+	}
+
+	summary, err := stats.Summary("project_a", now.Add(-time.Hour), now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("summarize stats: %v", err)
+	}
+	duration, ok := summary.ProviderDurations["mock_primary"]
+	if !ok || duration.Count != 1 {
+		t.Fatalf("expected provider duration under selected channel code, got %+v", summary.ProviderDurations)
+	}
+	if got := summary.Metrics[lite.MetricAttemptsSent]; got != 1 {
+		t.Fatalf("expected attempt sent metric, got %+v", summary.Metrics)
+	}
+}
+
+func TestWorkerUnresolvedChannelWritesChannelFailureAttempt(t *testing.T) {
+	harness := newWorkerHarness(t, provider.Accepted("provider_fallback"))
+	defer harness.close()
+
+	message := testWorkerMessage()
+	message.ProviderChannels = []string{"missing_primary", "mock_backup"}
+	if err := harness.worker.ProcessTask(context.Background(), lite.QueueTask{Message: message, AttemptNo: 1}); err != nil {
+		t.Fatalf("process missing channel task: %v", err)
+	}
+	if got := harness.fake.Requests(); len(got) != 0 {
+		t.Fatalf("expected missing channel not to call provider, got %+v", got)
+	}
+
+	attempts, err := harness.log.ListAttempts("project_a", message.MessageID)
+	if err != nil {
+		t.Fatalf("list attempts after missing channel: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("expected missing channel failure attempt, got %+v", attempts)
+	}
+	missingAttempt := attempts[0]
+	if missingAttempt.AttemptNo != 1 ||
+		missingAttempt.Provider != "" ||
+		missingAttempt.Transport != "" ||
+		missingAttempt.ProviderChannelCode != "missing_primary" ||
+		missingAttempt.Status != domain.AttemptStatusFailed ||
+		missingAttempt.FailureClass != domain.FailureClassChannel ||
+		missingAttempt.ErrorCode != domain.ErrorCodeProviderUnavailable {
+		t.Fatalf("unexpected missing channel attempt: %+v", missingAttempt)
+	}
+
+	retryTask, err := harness.queue.Dequeue(context.Background())
+	if err != nil {
+		t.Fatalf("dequeue fallback task: %v", err)
+	}
+	if retryTask.AttemptNo != 2 {
+		t.Fatalf("expected fallback attempt 2, got %d", retryTask.AttemptNo)
+	}
+	if err := harness.worker.ProcessTask(context.Background(), retryTask); err != nil {
+		t.Fatalf("process fallback task: %v", err)
+	}
+
+	requests := harness.fake.Requests()
+	if len(requests) != 1 || requests[0].Channel.Code != "mock_backup" {
+		t.Fatalf("expected one fallback provider call, got %+v", requests)
+	}
+	attempts, err = harness.log.ListAttempts("project_a", message.MessageID)
+	if err != nil {
+		t.Fatalf("list attempts after fallback: %v", err)
+	}
+	if len(attempts) != 3 {
+		t.Fatalf("expected missing failure plus sending and sent fallback attempts, got %+v", attempts)
+	}
+	if attempts[1].ProviderChannelCode != "mock_backup" || attempts[2].ProviderMessageID != "provider_fallback" {
+		t.Fatalf("unexpected fallback attempt metadata: %+v", attempts)
+	}
+}
+
+func TestWorkerInvalidRuntimeMetadataFailsBeforeProviderCall(t *testing.T) {
+	harness := newWorkerHarness(t, provider.Accepted("provider_should_not_send"))
+	defer harness.close()
+
+	fallbackResolver := testProviderResolver(harness.fake)
+	harness.worker.resolver = providerResolverFunc(func(channelCode string) (ProviderChannelRuntime, bool) {
+		if channelCode == "bad_primary" {
+			return ProviderChannelRuntime{
+				Account: domain.ProviderAccount{
+					Code:     "bad_main",
+					Provider: domain.Provider("bad"),
+					Enabled:  true,
+				},
+				Channel: domain.ProviderChannel{
+					Code:      "bad_primary",
+					Account:   "bad_main",
+					Transport: domain.Transport("bad"),
+					Enabled:   true,
+				},
+				Provider: harness.fake,
+			}, true
+		}
+
+		return fallbackResolver.Resolve(channelCode)
+	})
+
+	message := testWorkerMessage()
+	message.ProviderChannels = []string{"bad_primary", "mock_backup"}
+	if err := harness.worker.ProcessTask(context.Background(), lite.QueueTask{Message: message, AttemptNo: 1}); err != nil {
+		t.Fatalf("process invalid runtime metadata task: %v", err)
+	}
+	if got := harness.fake.Requests(); len(got) != 0 {
+		t.Fatalf("expected invalid runtime metadata not to call provider, got %+v", got)
+	}
+
+	attempts, err := harness.log.ListAttempts("project_a", message.MessageID)
+	if err != nil {
+		t.Fatalf("list attempts after invalid runtime metadata: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("expected one invalid metadata failure attempt, got %+v", attempts)
+	}
+	if attempts[0].Provider != "" ||
+		attempts[0].Transport != "" ||
+		attempts[0].ProviderChannelCode != "bad_primary" ||
+		attempts[0].FailureClass != domain.FailureClassChannel {
+		t.Fatalf("unexpected invalid metadata attempt: %+v", attempts[0])
+	}
+}
+
+func TestWorkerMismatchedRuntimeChannelFailsBeforeProviderCall(t *testing.T) {
+	harness := newWorkerHarness(t, provider.Accepted("provider_should_not_send"))
+	defer harness.close()
+
+	fallbackResolver := testProviderResolver(harness.fake)
+	harness.worker.resolver = providerResolverFunc(func(channelCode string) (ProviderChannelRuntime, bool) {
+		if channelCode == "mock_primary" {
+			return ProviderChannelRuntime{
+				Account: domain.ProviderAccount{
+					Code:     "mock_main",
+					Provider: domain.ProviderMock,
+					Enabled:  true,
+				},
+				Channel: domain.ProviderChannel{
+					Code:      "mock_backup",
+					Account:   "mock_main",
+					Transport: domain.TransportAPI,
+					Enabled:   true,
+				},
+				Provider: harness.fake,
+			}, true
+		}
+
+		return fallbackResolver.Resolve(channelCode)
+	})
+
+	message := testWorkerMessage()
+	message.ProviderChannels = []string{"mock_primary", "mock_backup"}
+	if err := harness.worker.ProcessTask(context.Background(), lite.QueueTask{Message: message, AttemptNo: 1}); err != nil {
+		t.Fatalf("process mismatched runtime channel task: %v", err)
+	}
+	if got := harness.fake.Requests(); len(got) != 0 {
+		t.Fatalf("expected mismatched runtime channel not to call provider, got %+v", got)
+	}
+
+	attempts, err := harness.log.ListAttempts("project_a", message.MessageID)
+	if err != nil {
+		t.Fatalf("list attempts after mismatched runtime channel: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("expected one mismatched runtime failure attempt, got %+v", attempts)
+	}
+	if attempts[0].Provider != "" ||
+		attempts[0].ProviderAccountCode != "" ||
+		attempts[0].Transport != "" ||
+		attempts[0].ProviderChannelCode != "mock_primary" ||
+		attempts[0].FailureClass != domain.FailureClassChannel {
+		t.Fatalf("unexpected mismatched runtime attempt: %+v", attempts[0])
+	}
+	if got := harness.queue.PendingCount(); got != 1 {
+		t.Fatalf("expected fallback retry to be queued, got %d", got)
 	}
 }
 
@@ -198,12 +466,45 @@ func TestWorkerBackoffFollowsRetryBackoff(t *testing.T) {
 	}
 }
 
+func TestSafeErrorMessageTruncatesAtUTF8Boundary(t *testing.T) {
+	message := strings.Repeat("a", 255) + "\u754c"
+
+	got := safeErrorMessage(message)
+	if len(got) > 256 {
+		t.Fatalf("expected truncated message to stay within 256 bytes, got %d", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("expected truncated message to remain valid UTF-8: %q", got)
+	}
+	if got != strings.Repeat("a", 255) {
+		t.Fatalf("expected partial multibyte rune to be omitted, got %q", got)
+	}
+}
+
+func TestSafeErrorMessageDropsInvalidUTF8(t *testing.T) {
+	message := "provider " + string([]byte{0xff}) + " failed"
+
+	got := safeErrorMessage(message)
+	if !utf8.ValidString(got) {
+		t.Fatalf("expected safe error message to be valid UTF-8: %q", got)
+	}
+	if got != "provider  failed" {
+		t.Fatalf("expected invalid bytes to be dropped, got %q", got)
+	}
+}
+
 type workerHarness struct {
 	dir    string
 	log    *lite.MessageLog
 	queue  *lite.MemoryQueue
 	fake   *provider.FakeProvider
 	worker *Worker
+}
+
+type providerResolverFunc func(channelCode string) (ProviderChannelRuntime, bool)
+
+func (f providerResolverFunc) Resolve(channelCode string) (ProviderChannelRuntime, bool) {
+	return f(channelCode)
 }
 
 func newWorkerHarness(t *testing.T, results ...provider.SendResult) *workerHarness {
@@ -223,6 +524,20 @@ func newWorkerHarnessWithNow(t *testing.T, now func() time.Time, results ...prov
 func newWorkerHarnessWithPolicy(t *testing.T, now func() time.Time, retryBackoff []int, results ...provider.SendResult) *workerHarness {
 	t.Helper()
 
+	return newWorkerHarnessWithQueueCapacityAndPolicy(t, now, retryBackoff, 10, results...)
+}
+
+func newWorkerHarnessWithQueueCapacity(t *testing.T, capacity int, results ...provider.SendResult) *workerHarness {
+	t.Helper()
+
+	return newWorkerHarnessWithQueueCapacityAndPolicy(t, func() time.Time {
+		return time.Date(2026, 5, 28, 3, 4, 5, 0, time.UTC)
+	}, []int{0, 0, 0}, capacity, results...)
+}
+
+func newWorkerHarnessWithQueueCapacityAndPolicy(t *testing.T, now func() time.Time, retryBackoff []int, capacity int, results ...provider.SendResult) *workerHarness {
+	t.Helper()
+
 	dir := t.TempDir()
 	log, err := lite.NewMessageLog(lite.MessageLogConfig{
 		Dir:        dir,
@@ -233,7 +548,7 @@ func newWorkerHarnessWithPolicy(t *testing.T, now func() time.Time, retryBackoff
 	if err != nil {
 		t.Fatalf("open message log: %v", err)
 	}
-	queue, err := lite.NewMemoryQueue(lite.MemoryQueueConfig{Capacity: 10, Now: now})
+	queue, err := lite.NewMemoryQueue(lite.MemoryQueueConfig{Capacity: capacity, Now: now})
 	if err != nil {
 		t.Fatalf("open queue: %v", err)
 	}

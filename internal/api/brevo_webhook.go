@@ -1,11 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/muxmail/muxmail/internal/config"
 	"github.com/muxmail/muxmail/internal/domain"
@@ -17,13 +19,16 @@ type brevoWebhookVerifier struct {
 }
 
 type brevoWebhookPayload struct {
-	Event     string   `json:"event"`
-	MessageID string   `json:"message-id"`
-	Date      string   `json:"date"`
-	Email     string   `json:"email"`
-	Tag       []string `json:"tag"`
-	Tags      []string `json:"tags"`
+	Event     string           `json:"event"`
+	MessageID string           `json:"message-id"`
+	Date      string           `json:"date"`
+	EventTS   int64            `json:"ts_event"`
+	Email     string           `json:"email"`
+	Tag       brevoWebhookTags `json:"tag"`
+	Tags      []string         `json:"tags"`
 }
+
+type brevoWebhookTags []string
 
 func newBrevoWebhookVerifier(webhooks config.WebhookConfig, resolver config.SecretResolver) (brevoWebhookVerifier, error) {
 	if !webhooks.Enabled || strings.TrimSpace(webhooks.BrevoTokenRef) == "" {
@@ -121,12 +126,7 @@ func decodeBrevoWebhookEvent(body []byte) (domain.ProviderEvent, error) {
 	if !ok {
 		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "event is invalid"}
 	}
-	tags := payload.Tag
-	if len(tags) == 0 {
-		tags = payload.Tags
-	}
-
-	values := parseBrevoMetadataTags(tags)
+	values := parseBrevoMetadataTags(combinedBrevoTags(payload))
 	event := domain.ProviderEvent{
 		MessageID:           values["message_id"],
 		AppCode:             values["app"],
@@ -137,22 +137,83 @@ func decodeBrevoWebhookEvent(body []byte) (domain.ProviderEvent, error) {
 		RecipientEmail:      strings.TrimSpace(payload.Email),
 		EventType:           eventType,
 		EventPayload:        `{"source":"brevo"}`,
-		OccurredAt:          strings.TrimSpace(payload.Date),
+		OccurredAt:          formatBrevoEventTimestamp(payload.EventTS),
 	}
 	if event.AppCode == "" || event.MessageID == "" {
 		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "app and message_id tags are required"}
 	}
-	if requiresSuppression(event.EventType) && domain.NormalizeEmail(event.RecipientEmail) == "" {
-		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "email is required for bounce and complaint events"}
+	if !isValidIdentifierFilter(event.AppCode) {
+		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "app is invalid"}
+	}
+	if !isValidMessageIDValue(event.MessageID) {
+		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "message_id is invalid"}
+	}
+	if err := validateProviderEventIdentity(&event); err != nil {
+		return domain.ProviderEvent{}, err
+	}
+	if err := validateProviderEventRecipientEmail(event); err != nil {
+		return domain.ProviderEvent{}, err
 	}
 
 	return event, nil
+}
+
+func formatBrevoEventTimestamp(value int64) string {
+	if value <= 0 {
+		return ""
+	}
+
+	return time.Unix(value, 0).UTC().Format(time.RFC3339Nano)
+}
+
+func (t *brevoWebhookTags) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if bytes.Equal(data, []byte("null")) {
+		*t = nil
+		return nil
+	}
+
+	var values []string
+	if err := json.Unmarshal(data, &values); err == nil {
+		*t = values
+		return nil
+	}
+
+	var single string
+	if err := json.Unmarshal(data, &single); err != nil {
+		return err
+	}
+	single = strings.TrimSpace(single)
+	if single == "" {
+		*t = nil
+		return nil
+	}
+	if strings.HasPrefix(single, "[") {
+		var encoded []string
+		if err := json.Unmarshal([]byte(single), &encoded); err == nil {
+			*t = encoded
+			return nil
+		}
+	}
+
+	*t = []string{single}
+	return nil
+}
+
+func combinedBrevoTags(payload brevoWebhookPayload) []string {
+	tags := make([]string, 0, len(payload.Tag)+len(payload.Tags))
+	tags = append(tags, payload.Tag...)
+	tags = append(tags, payload.Tags...)
+
+	return tags
 }
 
 func parseBrevoMetadataTags(tags []string) map[string]string {
 	values := make(map[string]string, len(tags))
 	for _, tag := range tags {
 		name, value, ok := strings.Cut(strings.TrimSpace(tag), ":")
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
 		if !ok || name == "" || value == "" {
 			continue
 		}

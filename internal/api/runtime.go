@@ -2,10 +2,14 @@ package api
 
 import (
 	"context"
+	"embed"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/muxmail/muxmail"
@@ -15,9 +19,13 @@ import (
 
 const shutdownTimeout = 10 * time.Second
 
+//go:embed admin_dist
+var embeddedAdminDist embed.FS
+
 // Runtime owns the first-phase HTTP server and Lite infrastructure.
 type Runtime struct {
 	server     *http.Server
+	cfg        *config.Config
 	messageLog *lite.MessageLog
 	stats      lite.StatsSink
 	queue      *lite.MemoryQueue
@@ -31,7 +39,8 @@ type Runtime struct {
 	brevoHook  brevoWebhookVerifier
 	defaults   config.DefaultsConfig
 	now        func() time.Time
-	ready      bool
+	eventMu    sync.Mutex
+	ready      atomic.Bool
 	closeOnce  sync.Once
 }
 
@@ -48,101 +57,106 @@ func NewRuntime(cfg *config.Config, resolver config.SecretResolver, options ...R
 		return nil, report.Err()
 	}
 
+	runtime := &Runtime{
+		cfg:      cfg,
+		defaults: cfg.Defaults,
+		now:      time.Now,
+	}
+	for _, option := range options {
+		option(runtime)
+	}
+	if runtime.now == nil {
+		runtime.now = time.Now
+	}
+
 	authenticator, err := NewAuthenticator(cfg.Apps, resolver)
 	if err != nil {
 		return nil, fmt.Errorf("initialize authenticator: %w", err)
 	}
+	runtime.auth = authenticator
 
 	messageLog, err := lite.NewMessageLog(lite.MessageLogConfig{
 		Dir:           cfg.Logging.Dir,
 		MaxBytes:      int64(cfg.Logging.MaxFileSizeMB) * 1024 * 1024,
 		MaxBackups:    cfg.Logging.MaxBackups,
 		EventsEnabled: cfg.Webhooks.Enabled,
+		Now:           runtime.now,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("initialize message log: %w", err)
 	}
+	runtime.messageLog = messageLog
 
-	stats, err := newStatsSink(cfg)
+	stats, err := newStatsSink(cfg, runtime.now)
 	if err != nil {
-		messageLog.Close()
+		runtime.closeInitializedDependencies()
 		return nil, err
 	}
+	runtime.stats = stats
 
-	queue, err := lite.NewMemoryQueue(lite.MemoryQueueConfig{Capacity: cfg.Defaults.MemoryQueueSize})
-	if err != nil {
-		messageLog.Close()
-		stats.Close()
-		return nil, fmt.Errorf("initialize memory queue: %w", err)
+	if runtime.queue == nil {
+		queue, err := lite.NewMemoryQueue(lite.MemoryQueueConfig{
+			Capacity: cfg.Defaults.MemoryQueueSize,
+			Now:      runtime.now,
+		})
+		if err != nil {
+			runtime.closeInitializedDependencies()
+			return nil, fmt.Errorf("initialize memory queue: %w", err)
+		}
+		runtime.queue = queue
 	}
 
-	idempotent, err := lite.NewIdempotencyCache(lite.IdempotencyCacheConfig{
-		Capacity: cfg.Defaults.IdempotencyCacheSize,
-		TTL:      time.Duration(cfg.Defaults.IdempotencyTTLHours) * time.Hour,
-	})
-	if err != nil {
-		messageLog.Close()
-		stats.Close()
-		queue.Close()
-		return nil, fmt.Errorf("initialize idempotency cache: %w", err)
+	if runtime.idempotent == nil {
+		idempotent, err := lite.NewIdempotencyCache(lite.IdempotencyCacheConfig{
+			Capacity: cfg.Defaults.IdempotencyCacheSize,
+			TTL:      time.Duration(cfg.Defaults.IdempotencyTTLHours) * time.Hour,
+			Now:      runtime.now,
+		})
+		if err != nil {
+			runtime.closeInitializedDependencies()
+			return nil, fmt.Errorf("initialize idempotency cache: %w", err)
+		}
+		runtime.idempotent = idempotent
 	}
 
-	suppressed, err := lite.LoadSuppressionStore(cfg.SuppressionFile)
-	if err != nil {
-		messageLog.Close()
-		stats.Close()
-		queue.Close()
-		return nil, fmt.Errorf("initialize suppression store: %w", err)
+	if runtime.suppressed == nil {
+		suppressed, err := lite.LoadSuppressionStore(cfg.SuppressionFile)
+		if err != nil {
+			runtime.closeInitializedDependencies()
+			return nil, fmt.Errorf("initialize suppression store: %w", err)
+		}
+		runtime.suppressed = suppressed
 	}
 
 	callerIP, err := newCallerIPResolver(cfg.Server.TrustedProxies)
 	if err != nil {
-		messageLog.Close()
-		stats.Close()
-		queue.Close()
+		runtime.closeInitializedDependencies()
 		return nil, fmt.Errorf("initialize caller IP resolver: %w", err)
 	}
+	runtime.callerIP = callerIP
 
 	webhook, err := newWebhookAuthenticator(cfg.Webhooks, resolver)
 	if err != nil {
-		messageLog.Close()
-		stats.Close()
-		queue.Close()
+		runtime.closeInitializedDependencies()
 		return nil, fmt.Errorf("initialize webhook authenticator: %w", err)
 	}
+	runtime.webhook = webhook
 	resendHook, err := newResendWebhookVerifier(cfg.Webhooks, resolver)
 	if err != nil {
-		messageLog.Close()
-		stats.Close()
-		queue.Close()
+		runtime.closeInitializedDependencies()
 		return nil, fmt.Errorf("initialize resend webhook verifier: %w", err)
 	}
+	resendHook.now = runtime.now
+	runtime.resendHook = resendHook
 	brevoHook, err := newBrevoWebhookVerifier(cfg.Webhooks, resolver)
 	if err != nil {
-		messageLog.Close()
-		stats.Close()
-		queue.Close()
+		runtime.closeInitializedDependencies()
 		return nil, fmt.Errorf("initialize brevo webhook verifier: %w", err)
 	}
+	runtime.brevoHook = brevoHook
 
-	runtime := &Runtime{
-		messageLog: messageLog,
-		stats:      stats,
-		queue:      queue,
-		rateLimit:  lite.NewFixedWindowRateLimiter(nil),
-		idempotent: idempotent,
-		suppressed: suppressed,
-		callerIP:   callerIP,
-		auth:       authenticator,
-		webhook:    webhook,
-		resendHook: resendHook,
-		brevoHook:  brevoHook,
-		defaults:   cfg.Defaults,
-		now:        time.Now,
-		ready:      true,
-	}
-	for _, option := range options {
-		option(runtime)
+	if runtime.rateLimit == nil {
+		runtime.rateLimit = lite.NewFixedWindowRateLimiter(runtime.now)
 	}
 	runtime.server = &http.Server{
 		Addr:              cfg.Server.Listen,
@@ -187,6 +201,9 @@ func WithSuppressionStore(store *lite.SuppressionStore) RuntimeOption {
 // WithNow overrides the runtime clock for deterministic API tests.
 func WithNow(now func() time.Time) RuntimeOption {
 	return func(runtime *Runtime) {
+		if now == nil {
+			return
+		}
 		runtime.now = now
 		runtime.resendHook.now = now
 	}
@@ -198,6 +215,9 @@ func (r *Runtime) Handler() http.Handler {
 	mux.HandleFunc("/healthz", r.handleHealthz)
 	mux.HandleFunc("/readyz", r.handleReadyz)
 	mux.HandleFunc("/version", r.handleVersion)
+	mux.HandleFunc("/admin", r.handleAdminRedirect)
+	mux.Handle("/admin/", r.adminHandler())
+	mux.HandleFunc("/v1/admin/config-summary", r.handleAdminConfigSummary)
 	mux.HandleFunc("/v1/mail/send", r.handleSend)
 	mux.HandleFunc("/v1/mail/messages/failed", r.handleFailedMessageList)
 	mux.HandleFunc("/v1/mail/messages", r.handleMessageList)
@@ -207,18 +227,87 @@ func (r *Runtime) Handler() http.Handler {
 	mux.HandleFunc("/v1/provider-events", r.handleProviderEvent)
 	mux.HandleFunc("/v1/provider-events/resend", r.handleResendProviderEvent)
 	mux.HandleFunc("/v1/provider-events/brevo", r.handleBrevoProviderEvent)
-	return mux
+	return rejectUnsafeAdminPaths(noStoreAPIResponses(mux))
+}
+
+func noStoreAPIResponses(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if strings.HasPrefix(request.URL.Path, "/v1/") {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set("Expires", "0")
+		}
+		next.ServeHTTP(w, request)
+	})
+}
+
+func rejectUnsafeAdminPaths(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if isUnsafeAdminRequestPath(request.URL.Path) || isUnsafeAdminRequestPath(request.URL.EscapedPath()) {
+			setAdminSecurityHeaders(w)
+			http.NotFound(w, request)
+			return
+		}
+		next.ServeHTTP(w, request)
+	})
+}
+
+func isUnsafeAdminRequestPath(path string) bool {
+	if path != "/admin" && !strings.HasPrefix(path, "/admin/") {
+		return false
+	}
+	if strings.ContainsAny(path, "\\:") || strings.Contains(path, "//") {
+		return true
+	}
+	if strings.Contains(path, "%") {
+		return true
+	}
+
+	for _, segment := range strings.Split(path, "/") {
+		if segment == "." || segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Runtime) handleAdminRedirect(w http.ResponseWriter, request *http.Request) {
+	setAdminSecurityHeaders(w)
+	if request.Method != http.MethodGet && request.Method != http.MethodHead {
+		http.NotFound(w, request)
+		return
+	}
+
+	http.Redirect(w, request, "/admin/", http.StatusMovedPermanently)
+}
+
+func (r *Runtime) adminHandler() http.Handler {
+	return adminFileHandler(embeddedAdminDist)
 }
 
 // Serve starts the HTTP server and blocks until the context is canceled or the server exits.
-func (r *Runtime) Serve(ctx context.Context) error {
+// The caller remains responsible for closing Lite resources after background workers stop.
+func (r *Runtime) Serve(ctx context.Context, readyCallbacks ...func(string)) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
+	listener, err := net.Listen("tcp", r.server.Addr)
+	if err != nil {
+		r.ready.Store(false)
+		return err
+	}
+	r.ready.Store(true)
+	defer r.ready.Store(false)
+	for _, callback := range readyCallbacks {
+		if callback != nil {
+			callback(listener.Addr().String())
+		}
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- r.server.ListenAndServe()
+		errCh <- r.server.Serve(listener)
 	}()
 
 	select {
@@ -230,7 +319,7 @@ func (r *Runtime) Serve(ctx context.Context) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		if err := r.Shutdown(shutdownCtx); err != nil {
+		if err := r.shutdownHTTP(shutdownCtx); err != nil {
 			return err
 		}
 		err := <-errCh
@@ -243,11 +332,13 @@ func (r *Runtime) Serve(ctx context.Context) error {
 
 // Shutdown gracefully stops HTTP traffic, discards pending queue tasks, and flushes logs.
 func (r *Runtime) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	var firstErr error
-	if r.server != nil {
-		if err := r.server.Shutdown(ctx); err != nil {
-			firstErr = err
-		}
+	if err := r.shutdownHTTP(ctx); err != nil {
+		firstErr = err
 	}
 	if err := r.Close(); firstErr == nil {
 		firstErr = err
@@ -256,11 +347,20 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 	return firstErr
 }
 
+func (r *Runtime) shutdownHTTP(ctx context.Context) error {
+	r.ready.Store(false)
+	if r.server == nil {
+		return nil
+	}
+
+	return r.server.Shutdown(ctx)
+}
+
 // Close releases Lite runtime resources.
 func (r *Runtime) Close() error {
 	var firstErr error
 	r.closeOnce.Do(func() {
-		r.ready = false
+		r.ready.Store(false)
 		if r.queue != nil {
 			firstErr = r.queue.Close()
 		}
@@ -277,6 +377,13 @@ func (r *Runtime) Close() error {
 	})
 
 	return firstErr
+}
+
+func (r *Runtime) closeInitializedDependencies() {
+	if r == nil {
+		return
+	}
+	_ = r.Close()
 }
 
 // Queue exposes the initialized Lite queue for later API and worker wiring.
@@ -318,7 +425,7 @@ func (r *Runtime) handleReadyz(w http.ResponseWriter, request *http.Request) {
 		http.NotFound(w, request)
 		return
 	}
-	if !r.ready {
+	if !r.ready.Load() {
 		writeStatusJSON(w, http.StatusServiceUnavailable, `{"status":"not_ready"}`)
 		return
 	}
@@ -335,7 +442,7 @@ func (r *Runtime) handleVersion(w http.ResponseWriter, request *http.Request) {
 	writeStatusJSON(w, http.StatusOK, fmt.Sprintf(`{"version":%q}`, muxmail.Version()))
 }
 
-func newStatsSink(cfg *config.Config) (lite.StatsSink, error) {
+func newStatsSink(cfg *config.Config, now func() time.Time) (lite.StatsSink, error) {
 	switch cfg.Runtime.Stats {
 	case "off":
 		return lite.NewNoopStatsSink(), nil
@@ -344,6 +451,7 @@ func newStatsSink(cfg *config.Config) (lite.StatsSink, error) {
 			Dir:        cfg.Logging.Dir,
 			MaxBytes:   int64(cfg.Logging.MaxFileSizeMB) * 1024 * 1024,
 			MaxBackups: cfg.Logging.MaxBackups,
+			Now:        now,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("initialize stats sink: %w", err)

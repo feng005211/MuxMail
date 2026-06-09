@@ -1,9 +1,5 @@
 package domain
 
-import (
-	"strings"
-)
-
 // RouteSelection contains the recipient domain and ordered provider channel candidates.
 type RouteSelection struct {
 	RecipientDomain string
@@ -49,13 +45,7 @@ func SelectRoute(scene Scene, normalizedToEmail string, maxAttemptsPerMessage in
 
 // RecipientDomain extracts the lowercase domain from a normalized email address.
 func RecipientDomain(normalizedToEmail string) (string, bool) {
-	trimmed := strings.TrimSpace(normalizedToEmail)
-	parts := strings.Split(trimmed, "@")
-	if len(parts) != 2 || parts[1] == "" {
-		return "", false
-	}
-
-	return strings.ToLower(parts[1]), true
+	return AddrSpecEmailDomain(normalizedToEmail)
 }
 
 func uniqueAndTruncateChannels(channels []string, maxAttemptsPerMessage int) []string {

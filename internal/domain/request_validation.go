@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/mail"
+	"net/netip"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -18,6 +19,7 @@ const (
 	defaultMaxContextBytes     = 4096
 	maxRecipientBytes          = 254
 	maxRecipientLocalBytes     = 64
+	maxSceneCodeBytes          = 64
 	maxIdempotencyKeyBytes     = 128
 	maxContextFields           = 16
 	maxContextFieldNameBytes   = 64
@@ -96,7 +98,7 @@ func ValidateSendRequest(input SendRequestValidationInput, options SendRequestVa
 		return SendRequest{}, err
 	}
 
-	scene, err := decodeStringField(raw, "scene", ErrorCodeInvalidJSON)
+	scene, err := validateSceneField(raw)
 	if err != nil {
 		return SendRequest{}, err
 	}
@@ -131,6 +133,52 @@ func ValidateSendRequest(input SendRequestValidationInput, options SendRequestVa
 	}, nil
 }
 
+// IsTemplateVarName reports whether name is accepted in send request vars.
+func IsTemplateVarName(name string) bool {
+	return name != "" && len(name) <= maxTemplateVarNameBytes && !strings.Contains(name, ".") && !containsWhitespace(name)
+}
+
+// IsAddrSpecEmail reports whether value is a single ASCII email addr-spec.
+func IsAddrSpecEmail(value string) bool {
+	_, ok := AddrSpecEmailDomain(value)
+	return ok
+}
+
+// NormalizeAddrSpecEmail validates value as a single addr-spec and returns its normalized form.
+func NormalizeAddrSpecEmail(value string) (string, bool) {
+	trimmed := strings.TrimSpace(value)
+	if !IsAddrSpecEmail(trimmed) {
+		return "", false
+	}
+
+	return NormalizeEmail(trimmed), true
+}
+
+// AddrSpecEmailDomain extracts the lowercase domain from a valid single ASCII addr-spec.
+func AddrSpecEmailDomain(value string) (string, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || len(trimmed) > maxRecipientBytes || !isASCII(trimmed) {
+		return "", false
+	}
+	if strings.ContainsAny(trimmed, "<>") || containsWhitespace(trimmed) {
+		return "", false
+	}
+	parsed, err := mail.ParseAddress(trimmed)
+	if err != nil || parsed.Address != trimmed {
+		return "", false
+	}
+	parts := strings.Split(trimmed, "@")
+	if len(parts) != 2 || !isAddrSpecLocalPart(parts[0]) || parts[1] == "" || len(parts[0]) > maxRecipientLocalBytes {
+		return "", false
+	}
+	domainPart := strings.ToLower(parts[1])
+	if !isAddrSpecDomain(domainPart) {
+		return "", false
+	}
+
+	return domainPart, true
+}
+
 func applySendRequestValidationDefaults(options SendRequestValidationOptions) SendRequestValidationOptions {
 	if options.MaxRequestBodyBytes <= 0 {
 		options.MaxRequestBodyBytes = defaultMaxRequestBodyBytes
@@ -151,7 +199,7 @@ func validateContentType(contentType string) error {
 	}
 
 	mediaType, _, err := mime.ParseMediaType(contentType)
-	if err != nil || mediaType != "application/json" {
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
 		return requestValidationError(ErrorCodeUnsupportedMediaType, "content type must be application/json")
 	}
 
@@ -187,21 +235,26 @@ func validateRecipientField(raw map[string]json.RawMessage) (string, string, err
 	}
 
 	trimmed := strings.TrimSpace(to)
-	if trimmed == "" || len(trimmed) > maxRecipientBytes || !isASCII(trimmed) {
-		return "", "", requestValidationError(ErrorCodeInvalidRecipient, "recipient is invalid")
-	}
-	if strings.ContainsAny(trimmed, "<>") || strings.Contains(trimmed, " ") {
-		return "", "", requestValidationError(ErrorCodeInvalidRecipient, "recipient must be a single addr-spec")
-	}
-	if _, err := mail.ParseAddress(trimmed); err != nil {
-		return "", "", requestValidationError(ErrorCodeInvalidRecipient, "recipient is invalid")
-	}
-	parts := strings.Split(trimmed, "@")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || len(parts[0]) > maxRecipientLocalBytes {
+	if !IsAddrSpecEmail(trimmed) {
 		return "", "", requestValidationError(ErrorCodeInvalidRecipient, "recipient is invalid")
 	}
 
 	return to, NormalizeEmail(trimmed), nil
+}
+
+func validateSceneField(raw map[string]json.RawMessage) (string, error) {
+	scene, err := decodeStringField(raw, "scene", ErrorCodeInvalidJSON)
+	if err != nil {
+		return "", err
+	}
+	if scene == "" {
+		return "", requestValidationError(ErrorCodeInvalidJSON, "scene is required")
+	}
+	if !isRequestIdentifier(scene) {
+		return "", requestValidationError(ErrorCodeInvalidJSON, "scene is invalid")
+	}
+
+	return scene, nil
 }
 
 func validateLocaleField(raw map[string]json.RawMessage, allowedLocales []string) (string, error) {
@@ -245,7 +298,7 @@ func validateVarsField(raw json.RawMessage, maxBytes int) (map[string]any, error
 		return nil, requestValidationError(ErrorCodeInvalidTemplateVars, "template variables contain too many fields")
 	}
 	for name, value := range vars {
-		if name == "" || len(name) > maxTemplateVarNameBytes || strings.Contains(name, ".") || containsWhitespace(name) {
+		if !IsTemplateVarName(name) {
 			return nil, requestValidationError(ErrorCodeInvalidTemplateVars, "template variable name is invalid")
 		}
 		if err := validateFlatJSONValue(value, maxTemplateVarStringBytes); err != nil {
@@ -280,10 +333,28 @@ func validateContextField(raw json.RawMessage, maxBytes int) (map[string]any, er
 		}
 	}
 
-	if requestID := stringValue(context["request_id"]); requestID != "" {
+	requestID, err := contextStringField(context, "request_id")
+	if err != nil {
+		return nil, err
+	}
+	if requestID != "" {
 		if len(requestID) > maxBusinessRequestIDBytes || !isVisibleASCIIWithoutWhitespace(requestID) {
 			return nil, requestValidationError(ErrorCodeInvalidContext, "context.request_id is invalid")
 		}
+	}
+	userIP, err := contextStringField(context, "user_ip")
+	if err != nil {
+		return nil, err
+	}
+	if userIP != "" {
+		addr, err := netip.ParseAddr(userIP)
+		if err != nil {
+			return nil, requestValidationError(ErrorCodeInvalidContext, "context.user_ip is invalid")
+		}
+		context["user_ip"] = normalizeIPAddr(addr).String()
+	}
+	if _, err := contextStringField(context, "user_id"); err != nil {
+		return nil, err
 	}
 
 	return context, nil
@@ -368,16 +439,97 @@ func containsWhitespace(value string) bool {
 	return false
 }
 
+func normalizeIPAddr(addr netip.Addr) netip.Addr {
+	if addr.Is4In6() {
+		return addr.Unmap()
+	}
+
+	return addr
+}
+
 func isRequestLocaleFormat(locale string) bool {
-	if len(locale) != 5 {
+	if len(locale) != 5 && len(locale) != 6 {
 		return false
 	}
 
-	return locale[0] >= 'a' && locale[0] <= 'z' &&
-		locale[1] >= 'a' && locale[1] <= 'z' &&
-		locale[2] == '-' &&
-		locale[3] >= 'A' && locale[3] <= 'Z' &&
-		locale[4] >= 'A' && locale[4] <= 'Z'
+	separatorIndex := len(locale) - 3
+	if locale[separatorIndex] != '-' {
+		return false
+	}
+	for index := 0; index < separatorIndex; index++ {
+		if locale[index] < 'a' || locale[index] > 'z' {
+			return false
+		}
+	}
+
+	return locale[separatorIndex+1] >= 'A' && locale[separatorIndex+1] <= 'Z' &&
+		locale[separatorIndex+2] >= 'A' && locale[separatorIndex+2] <= 'Z'
+}
+
+func isRequestIdentifier(value string) bool {
+	if value == "" || len(value) > maxSceneCodeBytes {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		valid := (char >= 'a' && char <= 'z') ||
+			(char >= '0' && char <= '9') ||
+			char == '_' ||
+			char == '-'
+		if !valid {
+			return false
+		}
+		if (index == 0 || index == len(value)-1) && !(char >= 'a' && char <= 'z') && !(char >= '0' && char <= '9') {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isAddrSpecDomain(value string) bool {
+	if value == "" || len(value) > 253 || strings.TrimSpace(value) != value || !isASCII(value) {
+		return false
+	}
+
+	labels := strings.Split(value, ".")
+	for _, label := range labels {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for index := 0; index < len(label); index++ {
+			char := label[index]
+			valid := (char >= 'a' && char <= 'z') ||
+				(char >= '0' && char <= '9') ||
+				char == '-'
+			if !valid {
+				return false
+			}
+			if (index == 0 || index == len(label)-1) && !(char >= 'a' && char <= 'z') && !(char >= '0' && char <= '9') {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func isAddrSpecLocalPart(value string) bool {
+	if value == "" || len(value) > maxRecipientLocalBytes || strings.HasPrefix(value, ".") || strings.HasSuffix(value, ".") || strings.Contains(value, "..") {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		valid := (char >= 'A' && char <= 'Z') ||
+			(char >= 'a' && char <= 'z') ||
+			(char >= '0' && char <= '9') ||
+			strings.ContainsRune("!#$%&'*+/=?^_`{|}~-.", rune(char))
+		if !valid {
+			return false
+		}
+	}
+
+	return true
 }
 
 func stringValue(value any) string {
@@ -386,4 +538,17 @@ func stringValue(value any) string {
 	}
 
 	return ""
+}
+
+func contextStringField(context map[string]any, name string) (string, error) {
+	value, exists := context[name]
+	if !exists {
+		return "", nil
+	}
+	typed, ok := value.(string)
+	if !ok {
+		return "", requestValidationError(ErrorCodeInvalidContext, "context."+name+" must be a string")
+	}
+
+	return typed, nil
 }

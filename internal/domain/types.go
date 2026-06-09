@@ -109,6 +109,7 @@ type Message struct {
 // Attempt records one provider channel delivery attempt.
 type Attempt struct {
 	MessageID           string
+	AppCode             string
 	AttemptNo           int
 	Provider            Provider
 	ProviderAccountCode string

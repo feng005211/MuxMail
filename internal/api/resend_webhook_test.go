@@ -34,6 +34,83 @@ func TestResendWebhookRejectsInvalidSignature(t *testing.T) {
 	assertErrorResponse(t, recorder, http.StatusUnauthorized, domain.ErrorCodeUnauthorized)
 }
 
+func TestResendWebhookVerifierUsesSingleClockSnapshot(t *testing.T) {
+	body := resendWebhookBody("project_a", "msg_clock_snapshot", "email.delivered")
+	signedAt := time.Date(2026, 6, 9, 12, 30, 0, 0, time.UTC)
+	secret, err := decodeSvixSecret(testResendWebhookSecret)
+	if err != nil {
+		t.Fatalf("decode test secret: %v", err)
+	}
+	calls := 0
+	verifier := resendWebhookVerifier{
+		enabled: true,
+		secret:  secret,
+		now: func() time.Time {
+			calls++
+			if calls == 1 {
+				return signedAt
+			}
+			return signedAt.Add(-resendWebhookTolerance - time.Nanosecond)
+		},
+	}
+	request := newResendWebhookRequest(body)
+	request.Header.Set("svix-id", "msg_123")
+	request.Header.Set("svix-timestamp", strconvFormatUnix(signedAt))
+	request.Header.Set("svix-signature", signSvixTestPayload(t, "msg_123", signedAt, body, testResendWebhookSecret))
+
+	if err := verifier.verify(request.Header, []byte(body)); err != nil {
+		t.Fatalf("expected verifier to use one clock snapshot, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one clock read, got %d", calls)
+	}
+}
+
+func TestResendWebhookRejectsInvalidIdentityBeforeLogQuery(t *testing.T) {
+	runtime, _ := openResendWebhookRuntime(t)
+	defer runtime.Close()
+
+	messageLog := runtime.messageLog
+	runtime.messageLog = nil
+	defer func() {
+		runtime.messageLog = messageLog
+	}()
+
+	for _, body := range []string{
+		resendWebhookBody("ProjectA", "msg_01ABC", "email.delivered"),
+		resendWebhookBody("project_a", "bad_01ABC", "email.delivered"),
+	} {
+		recorder := performResendWebhook(t, runtime, body, testResendWebhookSecret, time.Now())
+		assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidJSON)
+	}
+}
+
+func TestResendWebhookAcceptsCommaSeparatedMultipleSignatures(t *testing.T) {
+	runtime, _ := openResendWebhookRuntime(t)
+	defer runtime.Close()
+
+	message := testStatusMessage("msg_resend_multi_sig")
+	message.Status = domain.MessageStatusSent
+	if err := runtime.MessageLog().AppendMessage(message); err != nil {
+		t.Fatalf("append sent message: %v", err)
+	}
+	appendSentAttempt(t, runtime, "msg_resend_multi_sig", domain.ProviderResend, "resend_main", "resend_auth_api")
+
+	body := resendWebhookBody("project_a", "msg_resend_multi_sig", "email.delivered")
+	signedAt := time.Now()
+	validSignature := signSvixTestPayload(t, "msg_123", signedAt, body, testResendWebhookSecret)
+	request := newResendWebhookRequest(body)
+	request.Header.Set("svix-id", "msg_123")
+	request.Header.Set("svix-timestamp", strconvFormatUnix(signedAt))
+	request.Header.Set("svix-signature", "v1,"+base64.StdEncoding.EncodeToString([]byte("bad signature"))+","+validSignature)
+	recorder := httptest.NewRecorder()
+	runtime.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestResendWebhookAppendsDeliveredEvent(t *testing.T) {
 	runtime, _ := openResendWebhookRuntime(t)
 	defer runtime.Close()
@@ -43,6 +120,7 @@ func TestResendWebhookAppendsDeliveredEvent(t *testing.T) {
 	if err := runtime.MessageLog().AppendMessage(message); err != nil {
 		t.Fatalf("append sent message: %v", err)
 	}
+	appendSentAttempt(t, runtime, "msg_resend", domain.ProviderResend, "resend_main", "resend_auth_api")
 
 	recorder := performResendWebhook(t, runtime, resendWebhookBody("project_a", "msg_resend", "email.delivered"), testResendWebhookSecret, time.Now())
 	if recorder.Code != http.StatusAccepted {
@@ -69,6 +147,7 @@ func TestResendWebhookBounceAddsSuppression(t *testing.T) {
 	if err := runtime.MessageLog().AppendMessage(message); err != nil {
 		t.Fatalf("append sent message: %v", err)
 	}
+	appendSentAttempt(t, runtime, "msg_resend_bounce", domain.ProviderResend, "resend_main", "resend_auth_api")
 
 	recorder := performResendWebhook(t, runtime, resendWebhookBodyWithRecipient("project_a", "msg_resend_bounce", "email.bounced", "user@example.com"), testResendWebhookSecret, time.Now())
 	if recorder.Code != http.StatusAccepted {
@@ -87,11 +166,46 @@ func TestResendWebhookBounceAddsSuppression(t *testing.T) {
 	assertErrorResponse(t, blocked, http.StatusUnprocessableEntity, domain.ErrorCodeSuppressedRecipient)
 }
 
+func TestResendWebhookRejectsInvalidSuppressionRecipient(t *testing.T) {
+	runtime, _ := openResendWebhookRuntime(t)
+	defer runtime.Close()
+
+	recorder := performResendWebhook(t, runtime, resendWebhookBodyWithRecipient("project_a", "msg_resend_invalid_recipient", "email.bounced", "not an email"), testResendWebhookSecret, time.Now())
+	assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidJSON)
+}
+
 func TestResendWebhookRequiresMuxMailTags(t *testing.T) {
 	runtime, _ := openResendWebhookRuntime(t)
 	defer runtime.Close()
 
 	body := `{"type":"email.delivered","data":{"email_id":"provider_123","tags":{"app":"project_a"}},"created_at":"2026-05-28T03:00:00Z"}`
+	recorder := performResendWebhook(t, runtime, body, testResendWebhookSecret, time.Now())
+	assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidJSON)
+}
+
+func TestResendWebhookRequiresProviderIdentityTags(t *testing.T) {
+	runtime, _ := openResendWebhookRuntime(t)
+	defer runtime.Close()
+
+	body := `{"type":"email.delivered","data":{"email_id":"provider_123","tags":{"app":"project_a","message_id":"msg_missing_identity","provider_account":"resend_main"}},"created_at":"2026-05-28T03:00:00Z"}`
+	recorder := performResendWebhook(t, runtime, body, testResendWebhookSecret, time.Now())
+	assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidJSON)
+}
+
+func TestResendWebhookRequiresCreatedAt(t *testing.T) {
+	runtime, _ := openResendWebhookRuntime(t)
+	defer runtime.Close()
+
+	body := `{"type":"email.delivered","data":{"email_id":"provider_123","tags":{"app":"project_a","message_id":"msg_missing_created_at","provider_account":"resend_main","provider_channel":"resend_auth_api"}}}`
+	recorder := performResendWebhook(t, runtime, body, testResendWebhookSecret, time.Now())
+	assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidJSON)
+}
+
+func TestResendWebhookRejectsInvalidCreatedAt(t *testing.T) {
+	runtime, _ := openResendWebhookRuntime(t)
+	defer runtime.Close()
+
+	body := strings.Replace(resendWebhookBody("project_a", "msg_invalid_created_at", "email.delivered"), "2026-05-28T03:00:00Z", "2026-05-28 03:00:00", 1)
 	recorder := performResendWebhook(t, runtime, body, testResendWebhookSecret, time.Now())
 	assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidJSON)
 }
@@ -102,7 +216,6 @@ func openResendWebhookRuntime(t *testing.T) (*Runtime, *config.Config) {
 	cfg := testRuntimeConfig(t, "off")
 	cfg.Webhooks = config.WebhookConfig{
 		Enabled:         true,
-		SharedSecretRef: "plain:" + testWebhookSecret,
 		ResendSecretRef: "plain:" + testResendWebhookSecret,
 	}
 	runtime, err := NewRuntime(cfg, config.NewSecretResolver(), WithNow(time.Now))

@@ -69,6 +69,7 @@ type ProviderEventSnapshot struct {
 type AttemptSnapshot struct {
 	Timestamp           time.Time
 	MessageID           string
+	AppCode             string
 	AttemptNo           int
 	Provider            domain.Provider
 	ProviderAccountCode string
@@ -77,6 +78,7 @@ type AttemptSnapshot struct {
 	Status              domain.AttemptStatus
 	FailureClass        domain.FailureClass
 	ErrorCode           domain.ErrorCode
+	ErrorMessage        string
 	ProviderMessageID   string
 	DurationMS          int
 }
@@ -150,11 +152,39 @@ func (l *MessageLog) AppendProviderEvent(event domain.ProviderEvent) error {
 	return l.events.appendLine(encodeProviderEventRecord(l.now(), event))
 }
 
+// AppendProviderEventOnce appends event only when the same provider event identity is absent.
+func (l *MessageLog) AppendProviderEventOnce(event domain.ProviderEvent) (bool, error) {
+	if l.events == nil {
+		return false, fmt.Errorf("provider event log is disabled")
+	}
+
+	l.events.mu.Lock()
+	defer l.events.mu.Unlock()
+
+	for _, path := range l.eventQueryPaths() {
+		found, err := providerEventExistsInPath(path, event)
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return false, nil
+		}
+	}
+	if err := l.events.appendLineLocked(encodeProviderEventRecord(l.now(), event)); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 // HasProviderEvent reports whether an equivalent provider event has already been recorded.
 func (l *MessageLog) HasProviderEvent(event domain.ProviderEvent) (bool, error) {
 	if l.events == nil {
 		return false, nil
 	}
+
+	l.events.mu.Lock()
+	defer l.events.mu.Unlock()
 
 	for _, path := range l.eventQueryPaths() {
 		found, err := providerEventExistsInPath(path, event)
@@ -175,6 +205,9 @@ func (l *MessageLog) ListProviderEvents(appCode string, messageID string) ([]Pro
 		return []ProviderEventSnapshot{}, nil
 	}
 
+	l.events.mu.Lock()
+	defer l.events.mu.Unlock()
+
 	events := make([]ProviderEventSnapshot, 0)
 	for _, path := range l.eventQueryPaths() {
 		batch, err := listProviderEventsInPath(path, appCode, messageID)
@@ -192,6 +225,9 @@ func (l *MessageLog) ListRecentProviderEvents(appCode string, filter ProviderEve
 	if l.events == nil {
 		return []ProviderEventSnapshot{}, nil
 	}
+
+	l.events.mu.Lock()
+	defer l.events.mu.Unlock()
 
 	events := make([]ProviderEventSnapshot, 0)
 	for _, path := range l.eventQueryPaths() {
@@ -218,15 +254,18 @@ func (l *MessageLog) ListRecentProviderEvents(appCode string, filter ProviderEve
 	return events, nil
 }
 
-// ListAttempts returns all recorded provider attempts for one message.
-func (l *MessageLog) ListAttempts(messageID string) ([]AttemptSnapshot, error) {
+// ListAttempts returns all recorded provider attempts for one App-scoped message.
+func (l *MessageLog) ListAttempts(appCode string, messageID string) ([]AttemptSnapshot, error) {
 	if l.attempts == nil {
 		return nil, fmt.Errorf("attempt log is closed")
 	}
 
+	l.attempts.mu.Lock()
+	defer l.attempts.mu.Unlock()
+
 	attempts := make([]AttemptSnapshot, 0)
 	for _, path := range l.attemptQueryPaths() {
-		batch, err := listAttemptsInPath(path, messageID)
+		batch, err := listAttemptsInPath(path, appCode, messageID)
 		if err != nil {
 			return nil, err
 		}
@@ -241,6 +280,9 @@ func (l *MessageLog) ListLatestMessages(appCode string, filter MessageListFilter
 	if l.messages == nil {
 		return nil, fmt.Errorf("message log is closed")
 	}
+
+	l.messages.mu.Lock()
+	defer l.messages.mu.Unlock()
 
 	latestByMessage := make(map[string]MessageSnapshot)
 	for _, path := range l.messageQueryPaths() {
@@ -296,6 +338,9 @@ func (l *MessageLog) FindLatestMessage(appCode string, messageID string) (Messag
 		return MessageSnapshot{}, false, fmt.Errorf("message log is closed")
 	}
 
+	l.messages.mu.Lock()
+	defer l.messages.mu.Unlock()
+
 	var latest MessageSnapshot
 	found := false
 
@@ -338,15 +383,12 @@ func collectLatestMessagesInPath(path string, appCode string, latestByMessage ma
 	for scanner.Scan() {
 		snapshot, err := decodeMessageSnapshot(scanner.Bytes())
 		if err != nil {
-			return err
+			return fmt.Errorf("decode message log record in %s: %w", path, err)
 		}
 		if snapshot.AppCode != appCode {
 			continue
 		}
-		current, exists := latestByMessage[snapshot.MessageID]
-		if !exists || snapshot.Timestamp.After(current.Timestamp) || (snapshot.Timestamp.Equal(current.Timestamp) && snapshot.MessageID >= current.MessageID) {
-			latestByMessage[snapshot.MessageID] = snapshot
-		}
+		latestByMessage[snapshot.MessageID] = snapshot
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("scan message log: %w", err)
@@ -372,7 +414,7 @@ func findLatestMessageInPath(path string, appCode string, messageID string) (Mes
 	for scanner.Scan() {
 		snapshot, err := decodeMessageSnapshot(scanner.Bytes())
 		if err != nil {
-			return MessageSnapshot{}, false, err
+			return MessageSnapshot{}, false, fmt.Errorf("decode message log record in %s: %w", path, err)
 		}
 		if snapshot.AppCode != appCode || snapshot.MessageID != messageID {
 			continue
@@ -450,7 +492,7 @@ func decodeMessageSnapshot(line []byte) (MessageSnapshot, error) {
 	if err != nil {
 		return MessageSnapshot{}, fmt.Errorf("decode message log timestamp: %w", err)
 	}
-	if raw.MessageID == "" || raw.AppCode == "" || !raw.Status.IsValid() {
+	if raw.MessageID == "" || !raw.Status.IsValid() {
 		return MessageSnapshot{}, fmt.Errorf("decode message log record: required fields are invalid")
 	}
 
@@ -486,7 +528,7 @@ func providerEventExistsInPath(path string, target domain.ProviderEvent) (bool, 
 	for scanner.Scan() {
 		recorded, err := decodeProviderEventSnapshot(scanner.Bytes())
 		if err != nil {
-			return false, err
+			return false, fmt.Errorf("decode provider event log record in %s: %w", path, err)
 		}
 		if sameProviderEventIdentity(recorded, target) {
 			return true, nil
@@ -499,7 +541,7 @@ func providerEventExistsInPath(path string, target domain.ProviderEvent) (bool, 
 	return false, nil
 }
 
-func listAttemptsInPath(path string, messageID string) ([]AttemptSnapshot, error) {
+func listAttemptsInPath(path string, appCode string, messageID string) ([]AttemptSnapshot, error) {
 	file, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return []AttemptSnapshot{}, nil
@@ -515,9 +557,9 @@ func listAttemptsInPath(path string, messageID string) ([]AttemptSnapshot, error
 	for scanner.Scan() {
 		recorded, err := decodeAttemptSnapshot(scanner.Bytes())
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("decode attempt log record in %s: %w", path, err)
 		}
-		if recorded.MessageID != messageID {
+		if recorded.AppCode != appCode || recorded.MessageID != messageID {
 			continue
 		}
 		attempts = append(attempts, recorded)
@@ -533,6 +575,7 @@ func decodeAttemptSnapshot(line []byte) (AttemptSnapshot, error) {
 	var raw struct {
 		Timestamp           string               `json:"ts"`
 		MessageID           string               `json:"message_id"`
+		AppCode             string               `json:"app"`
 		AttemptNo           int                  `json:"attempt_no"`
 		Provider            domain.Provider      `json:"provider"`
 		ProviderAccountCode string               `json:"provider_account"`
@@ -541,6 +584,7 @@ func decodeAttemptSnapshot(line []byte) (AttemptSnapshot, error) {
 		Status              domain.AttemptStatus `json:"status"`
 		FailureClass        domain.FailureClass  `json:"failure_class"`
 		ErrorCode           domain.ErrorCode     `json:"error_code"`
+		ErrorMessage        string               `json:"error_message"`
 		ProviderMessageID   string               `json:"provider_message_id"`
 		DurationMS          int                  `json:"duration_ms"`
 	}
@@ -551,13 +595,18 @@ func decodeAttemptSnapshot(line []byte) (AttemptSnapshot, error) {
 	if err != nil {
 		return AttemptSnapshot{}, fmt.Errorf("decode attempt log timestamp: %w", err)
 	}
-	if raw.MessageID == "" || raw.AttemptNo <= 0 || !raw.Provider.IsValid() || !raw.Transport.IsValid() || !raw.Status.IsValid() || !raw.FailureClass.IsValid() {
+	if raw.MessageID == "" ||
+		raw.AttemptNo <= 0 ||
+		!raw.Status.IsValid() ||
+		!raw.FailureClass.IsValid() ||
+		!isValidAttemptProviderMetadata(raw.Provider, raw.ProviderAccountCode, raw.ProviderChannelCode, raw.Transport, raw.Status, raw.FailureClass) {
 		return AttemptSnapshot{}, fmt.Errorf("decode attempt log record: required fields are invalid")
 	}
 
 	return AttemptSnapshot{
 		Timestamp:           timestamp,
 		MessageID:           raw.MessageID,
+		AppCode:             raw.AppCode,
 		AttemptNo:           raw.AttemptNo,
 		Provider:            raw.Provider,
 		ProviderAccountCode: raw.ProviderAccountCode,
@@ -566,9 +615,26 @@ func decodeAttemptSnapshot(line []byte) (AttemptSnapshot, error) {
 		Status:              raw.Status,
 		FailureClass:        raw.FailureClass,
 		ErrorCode:           raw.ErrorCode,
+		ErrorMessage:        raw.ErrorMessage,
 		ProviderMessageID:   raw.ProviderMessageID,
 		DurationMS:          raw.DurationMS,
 	}, nil
+}
+
+func isValidAttemptProviderMetadata(provider domain.Provider, providerAccount string, providerChannel string, transport domain.Transport, status domain.AttemptStatus, failureClass domain.FailureClass) bool {
+	if provider.IsValid() && providerAccount != "" && providerChannel != "" && transport.IsValid() {
+		return true
+	}
+	if provider == "" &&
+		providerAccount == "" &&
+		providerChannel != "" &&
+		transport == "" &&
+		status == domain.AttemptStatusFailed &&
+		failureClass == domain.FailureClassChannel {
+		return true
+	}
+
+	return false
 }
 
 func listProviderEventsInPath(path string, appCode string, messageID string) ([]ProviderEventSnapshot, error) {
@@ -587,7 +653,7 @@ func listProviderEventsInPath(path string, appCode string, messageID string) ([]
 	for scanner.Scan() {
 		recorded, err := decodeProviderEventQuerySnapshot(scanner.Bytes())
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("decode provider event log record in %s: %w", path, err)
 		}
 		if recorded.AppCode != appCode || recorded.MessageID != messageID {
 			continue
@@ -617,7 +683,7 @@ func listRecentProviderEventsInPath(path string, appCode string, filter Provider
 	for scanner.Scan() {
 		recorded, err := decodeProviderEventQuerySnapshot(scanner.Bytes())
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("decode provider event log record in %s: %w", path, err)
 		}
 		if recorded.AppCode != appCode {
 			continue
@@ -653,7 +719,19 @@ func decodeProviderEventSnapshot(line []byte) (domain.ProviderEvent, error) {
 	if err := json.Unmarshal(line, &raw); err != nil {
 		return domain.ProviderEvent{}, fmt.Errorf("decode provider event log record: %w", err)
 	}
-	if raw.MessageID == "" || raw.AppCode == "" || !raw.Provider.IsValid() || !raw.EventType.IsValid() {
+	if _, err := time.Parse(time.RFC3339Nano, raw.Timestamp); err != nil {
+		return domain.ProviderEvent{}, fmt.Errorf("decode provider event log timestamp: %w", err)
+	}
+	if err := validateProviderEventLogFields(
+		raw.MessageID,
+		raw.AppCode,
+		raw.Provider,
+		raw.ProviderAccountCode,
+		raw.ProviderChannelCode,
+		raw.ProviderMessageID,
+		raw.EventType,
+		raw.OccurredAt,
+	); err != nil {
 		return domain.ProviderEvent{}, fmt.Errorf("decode provider event log record: required fields are invalid")
 	}
 
@@ -689,7 +767,16 @@ func decodeProviderEventQuerySnapshot(line []byte) (ProviderEventSnapshot, error
 	if err != nil {
 		return ProviderEventSnapshot{}, fmt.Errorf("decode provider event log timestamp: %w", err)
 	}
-	if raw.MessageID == "" || raw.AppCode == "" || !raw.Provider.IsValid() || !raw.EventType.IsValid() {
+	if err := validateProviderEventLogFields(
+		raw.MessageID,
+		raw.AppCode,
+		raw.Provider,
+		raw.ProviderAccountCode,
+		raw.ProviderChannelCode,
+		raw.ProviderMessageID,
+		raw.EventType,
+		raw.OccurredAt,
+	); err != nil {
 		return ProviderEventSnapshot{}, fmt.Errorf("decode provider event log record: required fields are invalid")
 	}
 
@@ -704,6 +791,24 @@ func decodeProviderEventQuerySnapshot(line []byte) (ProviderEventSnapshot, error
 		EventType:           raw.EventType,
 		OccurredAt:          raw.OccurredAt,
 	}, nil
+}
+
+func validateProviderEventLogFields(messageID string, appCode string, provider domain.Provider, providerAccount string, providerChannel string, providerMessageID string, eventType domain.ProviderEventType, occurredAt string) error {
+	if messageID == "" ||
+		appCode == "" ||
+		providerAccount == "" ||
+		providerChannel == "" ||
+		providerMessageID == "" ||
+		occurredAt == "" ||
+		!provider.IsValid() ||
+		!eventType.IsValid() {
+		return fmt.Errorf("required fields are invalid")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, occurredAt); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func sameProviderEventIdentity(left domain.ProviderEvent, right domain.ProviderEvent) bool {
@@ -748,6 +853,7 @@ func encodeAttemptRecord(ts time.Time, attempt domain.Attempt) []byte {
 	line = append(line, '{')
 	appendJSONField(&line, "ts", ts.UTC().Format(time.RFC3339Nano), true)
 	appendJSONField(&line, "message_id", attempt.MessageID, false)
+	appendJSONField(&line, "app", attempt.AppCode, false)
 	appendJSONIntField(&line, "attempt_no", attempt.AttemptNo, false)
 	appendJSONField(&line, "provider", string(attempt.Provider), false)
 	appendJSONField(&line, "provider_account", attempt.ProviderAccountCode, false)
@@ -756,6 +862,7 @@ func encodeAttemptRecord(ts time.Time, attempt domain.Attempt) []byte {
 	appendJSONField(&line, "status", string(attempt.Status), false)
 	appendJSONField(&line, "failure_class", string(attempt.FailureClass), false)
 	appendJSONField(&line, "error_code", string(attempt.ErrorCode), false)
+	appendJSONField(&line, "error_message", attempt.ErrorMessage, false)
 	appendJSONField(&line, "provider_message_id", attempt.ProviderMessageID, false)
 	appendJSONIntField(&line, "duration_ms", attempt.DurationMS, false)
 	line = append(line, '}')

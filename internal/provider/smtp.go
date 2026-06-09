@@ -13,7 +13,6 @@ import (
 	"net/mail"
 	"net/smtp"
 	"net/textproto"
-	"strings"
 
 	"github.com/muxmail/muxmail/internal/domain"
 )
@@ -77,12 +76,16 @@ func (t *SMTPTransport) Send(ctx context.Context, request SendRequest) (SendResu
 	if t.requirePort && request.Channel.SMTP.Port != 587 {
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "smtp port must be 587"), nil
 	}
+	envelope, result, failed := normalizeProviderEnvelope(request)
+	if failed {
+		return result, nil
+	}
 
 	password, err := t.password(request)
 	if err != nil {
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "smtp password unavailable"), nil
 	}
-	message, err := buildMIMEMessage(request)
+	message, err := buildMIMEMessage(request, envelope)
 	if err != nil {
 		return MessagePermanentFailure(domain.ErrorCodeInternal, "smtp message build failed"), nil
 	}
@@ -90,7 +93,7 @@ func (t *SMTPTransport) Send(ctx context.Context, request SendRequest) (SendResu
 	address := net.JoinHostPort(request.Channel.SMTP.Host, fmt.Sprintf("%d", request.Channel.SMTP.Port))
 	client, err := t.openClient(ctx, address, request.Channel.SMTP.Host)
 	if err != nil {
-		return TemporaryFailure(domain.ErrorCodeProviderUnavailable, "smtp connection failed"), nil
+		return classifySMTPError(err, smtpStageConnect), nil
 	}
 	defer client.Close()
 
@@ -107,10 +110,10 @@ func (t *SMTPTransport) Send(ctx context.Context, request SendRequest) (SendResu
 	if result, failed := smtpResult(client.Auth(smtp.PlainAuth("", request.Channel.SMTP.Username, password, request.Channel.SMTP.Host)), smtpStageAuth); failed {
 		return result, nil
 	}
-	if result, failed := smtpResult(client.Mail(request.Channel.From), smtpStageMailFrom); failed {
+	if result, failed := smtpResult(client.Mail(envelope.from), smtpStageMailFrom); failed {
 		return result, nil
 	}
-	if result, failed := smtpResult(client.Rcpt(strings.TrimSpace(request.Message.ToEmail)), smtpStageRcptTo); failed {
+	if result, failed := smtpResult(client.Rcpt(envelope.to), smtpStageRcptTo); failed {
 		return result, nil
 	}
 
@@ -170,12 +173,11 @@ func (t *SMTPTransport) openClient(ctx context.Context, address string, host str
 	return client, nil
 }
 
-func buildMIMEMessage(request SendRequest) ([]byte, error) {
-	from := (&mail.Address{Name: request.Channel.FromName, Address: request.Channel.From}).String()
-	to := strings.TrimSpace(request.Message.ToEmail)
+func buildMIMEMessage(request SendRequest, envelope providerEnvelope) ([]byte, error) {
+	from := (&mail.Address{Name: request.Channel.FromName, Address: envelope.from}).String()
 	headers := textproto.MIMEHeader{}
 	headers.Set("From", from)
-	headers.Set("To", to)
+	headers.Set("To", envelope.to)
 	headers.Set("Subject", mime.QEncoding.Encode("utf-8", request.Message.Subject))
 	headers.Set("MIME-Version", "1.0")
 

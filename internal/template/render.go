@@ -3,6 +3,7 @@ package template
 import (
 	"bytes"
 	htmltemplate "html/template"
+	"strings"
 	texttemplate "text/template"
 
 	"github.com/muxmail/muxmail/internal/domain"
@@ -44,6 +45,9 @@ func Render(app domain.App, scene domain.Scene, request domain.SendRequest) (Ren
 	subject, err := renderTextTemplate("subject", tmpl.Subject, request.Vars)
 	if err != nil {
 		return RenderedMail{}, renderError(domain.ErrorCodeTemplateRenderFailed, "template subject render failed")
+	}
+	if strings.TrimSpace(subject) == "" || !domain.IsSafeEmailHeaderValue(subject) {
+		return RenderedMail{}, renderError(domain.ErrorCodeTemplateRenderFailed, "template subject rendered an invalid header value")
 	}
 
 	htmlBody := ""

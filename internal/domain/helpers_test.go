@@ -1,7 +1,9 @@
 package domain
 
 import (
+	"encoding/json"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -23,6 +25,84 @@ func TestNormalizeEmailLowercasesOnly(t *testing.T) {
 	got := NormalizeEmail("User.Name+Tag@Gmail.COM")
 	if got != "user.name+tag@gmail.com" {
 		t.Fatalf("expected lowercase-only normalization, got %q", got)
+	}
+}
+
+func TestIsSafeEmailDisplayName(t *testing.T) {
+	for _, value := range []string{"", "MuxMail", "用户中心"} {
+		if !IsSafeEmailDisplayName(value) {
+			t.Fatalf("expected safe display name %q", value)
+		}
+	}
+	for _, value := range []string{"MuxMail\nBcc: attacker@example.com", "MuxMail\tOps", "MuxMail\x7f"} {
+		if IsSafeEmailDisplayName(value) {
+			t.Fatalf("expected unsafe display name %q", value)
+		}
+	}
+}
+
+func TestIsSafeEmailHeaderValue(t *testing.T) {
+	for _, value := range []string{"Your verification code", "验证码"} {
+		if !IsSafeEmailHeaderValue(value) {
+			t.Fatalf("expected safe header value %q", value)
+		}
+	}
+	for _, value := range []string{"Subject\r\nBcc: attacker@example.com", "Subject\tOps", "Subject\x7f"} {
+		if IsSafeEmailHeaderValue(value) {
+			t.Fatalf("expected unsafe header value %q", value)
+		}
+	}
+}
+
+func TestAddrSpecEmailValidation(t *testing.T) {
+	if !IsAddrSpecEmail("User@Example.COM") {
+		t.Fatal("expected valid addr-spec email")
+	}
+
+	normalized, ok := NormalizeAddrSpecEmail(" User@Example.COM ")
+	if !ok || normalized != "user@example.com" {
+		t.Fatalf("expected normalized addr-spec, got %q ok=%v", normalized, ok)
+	}
+
+	domain, ok := AddrSpecEmailDomain("User@Example.COM")
+	if !ok || domain != "example.com" {
+		t.Fatalf("expected lowercase domain, got %q ok=%v", domain, ok)
+	}
+
+	for _, value := range []string{
+		"User <user@example.com>",
+		"user example@example.com",
+		"user\n@example.com",
+		"user\v@example.com",
+		"usér@example.com",
+		`"user"@example.com`,
+		".user@example.com",
+		"user.@example.com",
+		"user..name@example.com",
+		"user(name)@example.com",
+		"user@example.com (comment)",
+		"user@bad..example.com",
+		"user@-bad.example.com",
+		"user@example-.com",
+		"user@bad_domain.example.com",
+		"not-an-email",
+	} {
+		if IsAddrSpecEmail(value) {
+			t.Fatalf("expected invalid addr-spec email %q", value)
+		}
+	}
+}
+
+func TestIsTemplateVarName(t *testing.T) {
+	for _, value := range []string{"code", "expire_minutes", "user-id", "验证码"} {
+		if !IsTemplateVarName(value) {
+			t.Fatalf("expected valid template var name %q", value)
+		}
+	}
+	for _, value := range []string{"", "code.value", "bad name", "bad\nname", strings.Repeat("a", 65)} {
+		if IsTemplateVarName(value) {
+			t.Fatalf("expected invalid template var name %q", value)
+		}
 	}
 }
 
@@ -83,6 +163,50 @@ func TestRequestFingerprintIsDeterministicByVarKeyOrder(t *testing.T) {
 	}
 }
 
+func TestRequestFingerprintCanonicalizesJSONNumberSemanticValues(t *testing.T) {
+	left, err := RequestFingerprint("user@example.com", "en-US", map[string]any{
+		"amount": json.Number("1"),
+		"scale":  json.Number("1000"),
+		"tax":    json.Number("1.2300"),
+	})
+	if err != nil {
+		t.Fatalf("expected fingerprint: %v", err)
+	}
+
+	right, err := RequestFingerprint("user@example.com", "en-US", map[string]any{
+		"amount": json.Number("1.0"),
+		"scale":  json.Number("1e3"),
+		"tax":    json.Number("1.23"),
+	})
+	if err != nil {
+		t.Fatalf("expected equivalent fingerprint: %v", err)
+	}
+	if left != right {
+		t.Fatalf("expected semantically equal JSON numbers to share fingerprint, got %s and %s", left, right)
+	}
+
+	changed, err := RequestFingerprint("user@example.com", "en-US", map[string]any{
+		"amount": json.Number("1.1"),
+		"scale":  json.Number("1e3"),
+		"tax":    json.Number("1.23"),
+	})
+	if err != nil {
+		t.Fatalf("expected changed fingerprint: %v", err)
+	}
+	if changed == left {
+		t.Fatal("expected different JSON number value to change fingerprint")
+	}
+}
+
+func TestRequestFingerprintRejectsInvalidJSONNumber(t *testing.T) {
+	_, err := RequestFingerprint("user@example.com", "en-US", map[string]any{
+		"amount": json.Number("01"),
+	})
+	if err == nil {
+		t.Fatal("expected invalid JSON number to fail")
+	}
+}
+
 func TestRequestFingerprintRejectsUnsupportedVars(t *testing.T) {
 	_, err := RequestFingerprint("user@example.com", "en-US", map[string]any{
 		"nested": map[string]any{"code": "123456"},
@@ -103,6 +227,23 @@ func TestConstantTimeEqualHex(t *testing.T) {
 	}
 	if ConstantTimeEqualHex(hash, hash[:len(hash)-1]) {
 		t.Fatal("expected different length hashes to compare false")
+	}
+}
+
+func TestIsValidAPIKeyValue(t *testing.T) {
+	valid := "mk_test_123456789012345678901234"
+	if !IsValidAPIKeyValue(valid) {
+		t.Fatalf("expected valid api key value %q", valid)
+	}
+	for _, value := range []string{
+		"short",
+		"mk_test_invalid_key_with_space 123",
+		"mk_test_invalid_key_123456_中文",
+		"mk_test_invalid_key_with_newline\n123",
+	} {
+		if IsValidAPIKeyValue(value) {
+			t.Fatalf("expected invalid api key value %q", value)
+		}
 	}
 }
 

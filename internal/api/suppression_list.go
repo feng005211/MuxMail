@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/mail"
 	"strconv"
 	"strings"
 
@@ -113,27 +112,9 @@ func parseSuppressionListFilter(httpRequest *http.Request) (lite.SuppressionList
 }
 
 func isValidSuppressionFilterEmail(value string) bool {
-	trimmed := strings.TrimSpace(value)
-	if trimmed == "" || !isASCII(trimmed) {
-		return false
-	}
-	if strings.ContainsAny(trimmed, "<>") || strings.Contains(trimmed, " ") {
-		return false
-	}
-	if _, err := mail.ParseAddress(trimmed); err != nil {
-		return false
-	}
-
-	parts := strings.Split(trimmed, "@")
-	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+	return isValidSingleAddrSpecEmail(value)
 }
 
-func isASCII(value string) bool {
-	for _, r := range value {
-		if r > 127 {
-			return false
-		}
-	}
-
-	return true
+func isValidSingleAddrSpecEmail(value string) bool {
+	return domain.IsAddrSpecEmail(value)
 }

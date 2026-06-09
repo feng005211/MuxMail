@@ -114,6 +114,21 @@ func TestFixedWindowRateLimiterRejectedRequestDoesNotIncrementOtherRules(t *test
 	assertRateLimitAllowed(t, limiter, req)
 }
 
+func TestFixedWindowRateLimiterRollbackRestoresConsumedQuota(t *testing.T) {
+	now := fixedRateLimitTime()
+	limiter := NewFixedWindowRateLimiter(func() time.Time { return now })
+
+	req := testRateLimitRequest()
+	req.Policy.SameEmailPerMinute = 1
+
+	decision, err := limiter.Allow(req)
+	if err != nil {
+		t.Fatalf("expected first request to be allowed: %v", err)
+	}
+	limiter.Rollback(decision)
+	assertRateLimitAllowed(t, limiter, req)
+}
+
 func assertRateLimitAllowed(t *testing.T, limiter *FixedWindowRateLimiter, req RateLimitRequest) {
 	t.Helper()
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/muxmail/muxmail/internal/domain"
 )
@@ -59,6 +60,23 @@ func TestResultWithRetryAfter(t *testing.T) {
 
 	if result.RetryAfterSeconds != 120 {
 		t.Fatalf("expected retry_after 120, got %d", result.RetryAfterSeconds)
+	}
+}
+
+func TestRetryAfterHTTPDateRoundsUp(t *testing.T) {
+	now := time.Date(2026, 5, 28, 3, 4, 5, int(100*time.Millisecond), time.UTC)
+	retryAt := now.Add(time.Second + time.Nanosecond)
+
+	if got := retryAfterSecondsUntil(now, retryAt); got != 2 {
+		t.Fatalf("expected retry-after HTTP date to round up to 2 seconds, got %d", got)
+	}
+}
+
+func TestRetryAfterHTTPDatePastReturnsZero(t *testing.T) {
+	now := time.Date(2026, 5, 28, 3, 4, 5, 0, time.UTC)
+
+	if got := retryAfterSecondsUntil(now, now.Add(-time.Nanosecond)); got != 0 {
+		t.Fatalf("expected past retry-after HTTP date to return zero, got %d", got)
 	}
 }
 

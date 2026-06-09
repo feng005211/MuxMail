@@ -63,6 +63,13 @@ jobs:
           go-version: "1.22"
           cache: true
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.19"
+          cache: npm
+          cache-dependency-path: web/admin/package-lock.json
+
       - name: Verify
         run: make verify
 

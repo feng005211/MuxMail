@@ -11,7 +11,10 @@ import (
 	"github.com/muxmail/muxmail/internal/lite"
 )
 
-const messageStatusPathPrefix = "/v1/mail/messages/"
+const (
+	messageStatusPathPrefix = "/v1/mail/messages/"
+	maxMessageIDBytes       = 128
+)
 
 type messageStatusResponse struct {
 	MessageID         string               `json:"message_id"`
@@ -74,11 +77,30 @@ func (r *Runtime) processMessageStatus(httpRequest *http.Request) (messageStatus
 
 func messageIDFromPath(path string) (string, bool) {
 	messageID := strings.TrimPrefix(path, messageStatusPathPrefix)
-	if messageID == "" || messageID == path || strings.Contains(messageID, "/") || strings.ContainsAny(messageID, " \t\r\n") {
+	if messageID == path || !isValidMessageIDValue(messageID) {
 		return "", false
 	}
 
 	return messageID, true
+}
+
+func isValidMessageIDValue(value string) bool {
+	if value == "" || len(value) > maxMessageIDBytes || !strings.HasPrefix(value, "msg_") {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		valid := (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '_' ||
+			char == '-'
+		if !valid {
+			return false
+		}
+	}
+
+	return len(value) > len("msg_")
 }
 
 func messageStatusFromSnapshot(snapshot lite.MessageSnapshot) messageStatusResponse {

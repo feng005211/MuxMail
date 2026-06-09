@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	slashpath "path"
 	"path/filepath"
@@ -201,7 +203,16 @@ func LoadFile(configPath string) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("parse config file: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("parse config file: config file must contain a single YAML document")
+		}
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
@@ -265,7 +276,7 @@ func (c *Config) applyDefaults() {
 		c.Defaults.MaxAttemptsPerMessage = defaultMaxAttemptsPerMessage
 	}
 	if len(c.Defaults.RetryBackoffSeconds) == 0 {
-		c.Defaults.RetryBackoffSeconds = append([]int(nil), defaultRetryBackoffSeconds...)
+		c.Defaults.RetryBackoffSeconds = defaultRetryBackoffForAttempts(c.Defaults.MaxAttemptsPerMessage)
 	}
 	if c.Defaults.MemoryQueueSize == 0 {
 		c.Defaults.MemoryQueueSize = defaultMemoryQueueSize
@@ -301,6 +312,14 @@ func (c *Config) applyDefaults() {
 	if c.SuppressionFile == "" {
 		c.SuppressionFile = defaultSuppressionFile
 	}
+}
+
+func defaultRetryBackoffForAttempts(maxAttempts int) []int {
+	if maxAttempts > 0 && maxAttempts <= len(defaultRetryBackoffSeconds) {
+		return append([]int(nil), defaultRetryBackoffSeconds[:maxAttempts]...)
+	}
+
+	return append([]int(nil), defaultRetryBackoffSeconds...)
 }
 
 func (c *Config) resolveRelativePaths() {

@@ -13,6 +13,7 @@ security:
   - AppBearerAuth: []
 tags:
   - name: Health
+  - name: Admin
   - name: Send
   - name: Messages
   - name: Suppressions
@@ -73,6 +74,9 @@ paths:
           required: true
           schema:
             type: string
+            minLength: 1
+            maxLength: 128
+            pattern: "^[!-~]+$"
       requestBody:
         required: true
         content:
@@ -120,6 +124,9 @@ paths:
           name: scene
           schema:
             type: string
+            minLength: 1
+            maxLength: 64
+            pattern: "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
       responses:
         "200":
           description: Latest message snapshots
@@ -157,6 +164,9 @@ paths:
           name: scene
           schema:
             type: string
+            minLength: 1
+            maxLength: 64
+            pattern: "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
       responses:
         "200":
           description: Failed message snapshots
@@ -188,6 +198,8 @@ paths:
           required: true
           schema:
             type: string
+            pattern: ^msg_[A-Za-z0-9_-]{1,124}$
+            maxLength: 128
       responses:
         "200":
           description: Latest message snapshot
@@ -219,6 +231,8 @@ paths:
           required: true
           schema:
             type: string
+            pattern: ^msg_[A-Za-z0-9_-]{1,124}$
+            maxLength: 128
       responses:
         "200":
           description: Provider event timeline
@@ -250,6 +264,8 @@ paths:
           required: true
           schema:
             type: string
+            pattern: ^msg_[A-Za-z0-9_-]{1,124}$
+            maxLength: 128
       responses:
         "200":
           description: Provider attempt timeline
@@ -291,6 +307,10 @@ paths:
           name: email
           schema:
             type: string
+            format: email
+            maxLength: 254
+            pattern: "^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+            description: Must be a single ASCII addr-spec value without display name syntax, comments, whitespace, or non-ASCII characters.
       responses:
         "200":
           description: Suppression list
@@ -354,6 +374,7 @@ paths:
     post:
       tags: [ProviderEvents]
       summary: Accept one normalized provider event
+      description: Requires webhooks.enabled and webhooks.shared_secret_ref, complete provider identity metadata, and only accepts events matching a recorded sent attempt for the same App and message. If the recorded sent attempt has an empty provider_message_id because an accepted provider response omitted it, the event must still provide provider_message_id and match the recorded provider account and channel. Bounced and complained events must include a valid single addr-spec recipient_email so MuxMail can update suppressions. Lite mode logs a redacted source summary instead of the raw event_payload. Duplicate identities do not append another event record, but may replay idempotent suppression and monotonic status repair.
       security:
         - WebhookBearerAuth: []
       requestBody:
@@ -385,6 +406,7 @@ paths:
     post:
       tags: [ProviderEvents]
       summary: Accept one native Resend webhook event
+      description: Requires webhooks.enabled and webhooks.resend_secret_ref. Verifies Svix headers, requires MuxMail tags for app, message_id, provider_account, and provider_channel, then accepts only events matching a recorded sent attempt. If the sent attempt has an empty provider_message_id because the accepted Resend response omitted it, the webhook email_id is still required and the recorded provider account and channel must match. Bounce and complaint events must include a valid single addr-spec recipient email for suppression updates.
       security: []
       parameters:
         - in: header
@@ -432,6 +454,7 @@ paths:
     post:
       tags: [ProviderEvents]
       summary: Accept one native Brevo webhook event
+      description: Requires webhooks.enabled and webhooks.brevo_token_ref. Verifies the configured Bearer token, requires MuxMail metadata tags for app, message_id, provider_account, and provider_channel, requires ts_event for UTC occurred_at normalization, then accepts only events matching a recorded sent attempt. If the sent attempt has an empty provider_message_id because the accepted Brevo response omitted it, the webhook message-id is still required and the recorded provider account and channel must match. Bounce and complaint events must include a valid single addr-spec recipient email for suppression updates.
       security:
         - WebhookBearerAuth: []
       requestBody:
@@ -492,6 +515,26 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /v1/admin/config-summary:
+    get:
+      tags: [Admin]
+      summary: Query App-scoped admin configuration metadata
+      description: Returns Lite admin configuration metadata without API keys, provider secrets, webhook secrets, SMTP passwords, or runtime filesystem paths. All /v1/ responses are served with Cache-Control no-store.
+      security:
+        - AppBearerAuth: []
+      responses:
+        "200":
+          description: Safe App-scoped configuration summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminConfigSummaryResponse"
+        "401":
+          description: Missing or invalid App API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 components:
   securitySchemes:
     AppBearerAuth:
@@ -502,8 +545,8 @@ components:
     WebhookBearerAuth:
       type: http
       scheme: bearer
-      bearerFormat: webhook secret
-      description: Shared webhook secret used by MuxMail normalized provider events and Brevo webhook events.
+      bearerFormat: webhook secret or token
+      description: Bearer authentication for MuxMail normalized provider events using webhooks.shared_secret_ref, and for Brevo webhook events using webhooks.brevo_token_ref.
   schemas:
     HealthResponse:
       type: object
@@ -542,26 +585,59 @@ components:
               type: string
     SendRequest:
       type: object
-      required: [scene, to, vars]
+      required: [scene, to]
       properties:
         scene:
           type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
         to:
           type: string
+          format: email
+          maxLength: 254
+          pattern: "^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+          description: Must be a single ASCII addr-spec value without display name syntax, comments, whitespace, or non-ASCII characters.
         locale:
           type: string
+          pattern: "^[a-z]{2,3}-[A-Z]{2}$"
         vars:
           type: object
+          maxProperties: 32
+          propertyNames:
+            minLength: 1
+            maxLength: 64
+            pattern: "^[^\\s.]+$"
           additionalProperties:
             oneOf:
               - type: string
+                maxLength: 1024
               - type: number
               - type: boolean
         context:
           type: object
+          maxProperties: 16
+          propertyNames:
+            minLength: 1
+            maxLength: 64
+          properties:
+            user_ip:
+              oneOf:
+                - type: string
+                  format: ipv4
+                - type: string
+                  format: ipv6
+            user_id:
+              type: string
+              maxLength: 256
+            request_id:
+              type: string
+              maxLength: 128
+              pattern: "^[!-~]+$"
           additionalProperties:
             oneOf:
               - type: string
+                maxLength: 256
               - type: number
               - type: boolean
     SendResponse:
@@ -629,7 +705,7 @@ components:
             $ref: "#/components/schemas/MessageEventEntry"
     MessageEventEntry:
       type: object
-      required: [logged_at, provider, provider_account, provider_channel, provider_message_id, event_type]
+      required: [logged_at, provider, provider_account, provider_channel, provider_message_id, event_type, occurred_at]
       properties:
         logged_at:
           type: string
@@ -646,6 +722,7 @@ components:
           $ref: "#/components/schemas/ProviderEventType"
         occurred_at:
           type: string
+          format: date-time
     MessageAttemptsResponse:
       type: object
       required: [message_id, app, attempts]
@@ -668,19 +745,26 @@ components:
         attempt_no:
           type: integer
         provider:
-          $ref: "#/components/schemas/Provider"
+          type: string
+          enum: ["", mock, resend, brevo]
+          description: Empty only when a runtime channel resolution failure occurs before provider metadata is available.
         provider_account:
           type: string
+          description: Empty only when a runtime channel resolution failure occurs before account metadata is available.
         provider_channel:
           type: string
         transport:
-          $ref: "#/components/schemas/Transport"
+          type: string
+          enum: ["", api, smtp]
+          description: Empty only when a runtime channel resolution failure occurs before transport metadata is available.
         status:
           $ref: "#/components/schemas/AttemptStatus"
         failure_class:
           $ref: "#/components/schemas/FailureClass"
         error_code:
           $ref: "#/components/schemas/ErrorCode"
+        error_message:
+          type: string
         provider_message_id:
           type: string
         duration_ms:
@@ -721,7 +805,7 @@ components:
             $ref: "#/components/schemas/ProviderEventListEntry"
     ProviderEventListEntry:
       type: object
-      required: [message_id, logged_at, provider, provider_account, provider_channel, provider_message_id, event_type]
+      required: [message_id, logged_at, provider, provider_account, provider_channel, provider_message_id, event_type, occurred_at]
       properties:
         message_id:
           type: string
@@ -740,30 +824,48 @@ components:
           $ref: "#/components/schemas/ProviderEventType"
         occurred_at:
           type: string
+          format: date-time
     ProviderEventRequest:
       type: object
-      required: [app, message_id, provider, event_type, occurred_at]
+      required: [app, message_id, provider, provider_account, provider_channel, provider_message_id, event_type, occurred_at]
       properties:
         app:
           type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
         message_id:
           type: string
+          pattern: ^msg_[A-Za-z0-9_-]{1,124}$
+          maxLength: 128
         provider:
           $ref: "#/components/schemas/Provider"
         provider_account:
           type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
         provider_channel:
           type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
         provider_message_id:
           type: string
         recipient_email:
           type: string
+          format: email
+          maxLength: 254
+          pattern: "^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+          description: Required for bounced and complained events; must be a single addr-spec value without display name syntax.
         event_type:
           $ref: "#/components/schemas/ProviderEventType"
         event_payload:
           type: string
+          description: Accepted for compatibility with normalized webhook senders; Lite mode logs a redacted source summary instead of this raw payload.
         occurred_at:
           type: string
+          format: date-time
     ProviderEventResponse:
       type: object
       required: [message_id, app, status]
@@ -808,6 +910,206 @@ components:
                 type: number
               total_ms:
                 type: number
+    AdminConfigSummaryResponse:
+      type: object
+      required: [app, runtime, defaults, provider_accounts, provider_channels]
+      properties:
+        app:
+          $ref: "#/components/schemas/AdminAppSummary"
+        runtime:
+          $ref: "#/components/schemas/AdminRuntimeSummary"
+        defaults:
+          $ref: "#/components/schemas/AdminDefaultsSummary"
+        provider_accounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminProviderAccountSummary"
+        provider_channels:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminProviderChannelSummary"
+    AdminAppSummary:
+      type: object
+      required: [code, name, enabled, default_locale, allowed_locales, api_keys, scenes, templates]
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+        enabled:
+          type: boolean
+        default_locale:
+          type: string
+        allowed_locales:
+          type: array
+          items:
+            type: string
+        api_keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminAPIKeySummary"
+        scenes:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminSceneSummary"
+        templates:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminTemplateSummary"
+    AdminAPIKeySummary:
+      type: object
+      required: [name, enabled]
+      properties:
+        name:
+          type: string
+        enabled:
+          type: boolean
+    AdminSceneSummary:
+      type: object
+      required: [code, name, enabled, template, rate_limit, route_policy]
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+        enabled:
+          type: boolean
+        template:
+          type: string
+        rate_limit:
+          $ref: "#/components/schemas/AdminRateLimitSummary"
+        route_policy:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+    AdminRateLimitSummary:
+      type: object
+      required: [same_email_per_minute, same_email_per_day, same_user_ip_per_hour, same_caller_ip_per_hour]
+      properties:
+        same_email_per_minute:
+          type: integer
+        same_email_per_day:
+          type: integer
+        same_user_ip_per_hour:
+          type: integer
+        same_caller_ip_per_hour:
+          type: integer
+    AdminTemplateSummary:
+      type: object
+      required: [code, locale, enabled, subject, required_vars, has_html, has_text]
+      properties:
+        code:
+          type: string
+        locale:
+          type: string
+        enabled:
+          type: boolean
+        subject:
+          type: string
+        required_vars:
+          type: array
+          items:
+            type: string
+        has_html:
+          type: boolean
+        has_text:
+          type: boolean
+    AdminRuntimeSummary:
+      type: object
+      required: [config_store, queue, rate_limiter, message_log, stats, suppression, webhooks]
+      properties:
+        config_store:
+          type: string
+        queue:
+          type: string
+        rate_limiter:
+          type: string
+        message_log:
+          type: string
+        stats:
+          type: string
+        suppression:
+          type: string
+        webhooks:
+          type: boolean
+    AdminDefaultsSummary:
+      type: object
+      required:
+        - provider_timeout_seconds
+        - max_attempts_per_message
+        - retry_backoff_seconds
+        - memory_queue_size
+        - worker_concurrency
+        - idempotency_cache_size
+        - idempotency_ttl_hours
+        - max_request_body_bytes
+        - max_template_var_bytes
+        - max_context_bytes
+      properties:
+        provider_timeout_seconds:
+          type: integer
+        max_attempts_per_message:
+          type: integer
+        retry_backoff_seconds:
+          type: array
+          items:
+            type: integer
+        memory_queue_size:
+          type: integer
+        worker_concurrency:
+          type: integer
+        idempotency_cache_size:
+          type: integer
+        idempotency_ttl_hours:
+          type: integer
+        max_request_body_bytes:
+          type: integer
+        max_template_var_bytes:
+          type: integer
+        max_context_bytes:
+          type: integer
+    AdminProviderAccountSummary:
+      type: object
+      required: [code, provider, enabled]
+      properties:
+        code:
+          type: string
+        provider:
+          $ref: "#/components/schemas/Provider"
+        enabled:
+          type: boolean
+    AdminProviderChannelSummary:
+      type: object
+      required: [code, account, provider, transport, enabled, sender_domain, from_name, from]
+      properties:
+        code:
+          type: string
+        account:
+          type: string
+        provider:
+          $ref: "#/components/schemas/Provider"
+        transport:
+          $ref: "#/components/schemas/Transport"
+        enabled:
+          type: boolean
+        sender_domain:
+          type: string
+        from_name:
+          type: string
+        from:
+          type: string
+        smtp:
+          $ref: "#/components/schemas/AdminSMTPSummary"
+    AdminSMTPSummary:
+      type: object
+      required: [host, port]
+      properties:
+        host:
+          type: string
+        port:
+          type: integer
     MessageStatus:
       type: string
       enum: [queued, sending, retrying, sent, failed, delivered, bounced, complained]

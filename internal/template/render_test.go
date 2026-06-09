@@ -96,6 +96,30 @@ func TestRenderFailureUsesStableErrorCode(t *testing.T) {
 	assertRenderErrorCode(t, err, domain.ErrorCodeTemplateRenderFailed)
 }
 
+func TestRenderRejectsInvalidRenderedSubject(t *testing.T) {
+	tests := []struct {
+		name    string
+		subject string
+		code    string
+	}{
+		{name: "empty", subject: "{{ .code }}", code: ""},
+		{name: "newline", subject: "Your code {{ .code }}", code: "123456\r\nBcc: attacker@example.com"},
+		{name: "tab", subject: "Your code {{ .code }}", code: "123456\tops"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := testApp()
+			app.Templates[0].Subject = tt.subject
+			request := testRequest("en-US")
+			request.Vars["code"] = tt.code
+
+			_, err := Render(app, testScene(), request)
+			assertRenderErrorCode(t, err, domain.ErrorCodeTemplateRenderFailed)
+		})
+	}
+}
+
 func TestRenderEscapesHTMLBody(t *testing.T) {
 	request := testRequest("en-US")
 	request.Vars["code"] = `<b>123456</b>`

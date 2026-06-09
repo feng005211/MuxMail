@@ -953,7 +953,7 @@ Acceptance criteria:
 - Brevo native events require `webhooks.brevo_token_ref` and Bearer authentication.
 - Supported events are `delivered`, `bounced`, and `complained`.
 - Duplicate event identity does not append duplicate event records or message status records.
-- Bounce and complaint events update `suppression.yaml` only when a recipient email is present.
+- Bounce and complaint events require a valid single addr-spec recipient email before updating `suppression.yaml`.
 - Event JSONL records do not include full recipient email or raw provider payload.
 - Errors return stable API error codes.
 

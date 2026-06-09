@@ -11,6 +11,7 @@ MuxMail 是一个自托管的事务邮件路由网关，面向验证码、找回
 - 按 App 隔离的 API Key、Scene、Template、Route Policy 和 Provider Channel。
 - 异步发送接口 `POST /v1/mail/send`。
 - 按 App 隔离的消息、尝试、退信名单、Provider Event 和统计摘要只读 API。
+- 可选内置 Lite Admin UI，路径为 `/admin/`，支持仪表盘、消息排查、Provider Event、退信名单、测试发送和安全配置摘要。
 - 可选的标准化事件、Resend 原生事件、Brevo 原生事件接收器。
 - 通过 Mock API、Resend API/SMTP、Brevo API/SMTP 进行 Provider failover。
 - 进程内 fixed-window 限流和幂等控制。
@@ -23,7 +24,7 @@ MuxMail 是一个自托管的事务邮件路由网关，面向验证码、找回
 
 - 不做 Tenant 模型。
 - 不要求 PostgreSQL 或 Redis。
-- 不要求 Admin UI。
+- 不要求使用 Lite Admin，且 Lite Admin 不做在线编辑配置。
 - 不做入站 SMTP Server。
 - 默认不启用 Provider Webhook Receiver。
 - 不做营销群发、附件、打开追踪或点击追踪。
@@ -34,7 +35,7 @@ MuxMail 是一个自托管的事务邮件路由网关，面向验证码、找回
 $env:GOCACHE = (Join-Path (Get-Location) '.gocache')
 go test ./...
 go vet ./...
-go build -o ./bin/muxmail ./cmd/muxmail
+make build
 ```
 
 如果你的系统默认 Go cache 目录可写，也可以不设置 `GOCACHE`。
@@ -44,6 +45,8 @@ go build -o ./bin/muxmail ./cmd/muxmail
 ```sh
 make verify
 ```
+
+`make verify` 会先在 `web/admin` 内执行 `npm ci`，构建 Lite Admin UI，临时放入 Go 嵌入资源目录完成二进制构建，然后恢复源码树里的轻量占位资源。
 
 ## 配置校验与 Dry-Run
 
@@ -86,6 +89,16 @@ make dry-run-example
 ```powershell
 go run ./cmd/muxmail serve -c config.yaml
 ```
+
+源码目录本地运行时，先用 `make admin-build` 或 `cd web/admin && npm run build` 生成 `web/admin/dist`；Docker 镜像构建会自动完成这一步。
+
+打开内置 Lite Admin UI：
+
+```text
+http://localhost:8080/admin/
+```
+
+管理界面在当前浏览器会话中使用 App API Key 调用现有 App 隔离 API。API Key 只保存在页面内存中，不写入浏览器存储，也不暴露 Provider 密钥或在线编辑 YAML 配置；`/v1/` API 响应会带 `Cache-Control: no-store`。`/admin/` HTML 入口同样使用 `no-store`，避免升级后浏览器继续缓存旧 Admin bundle。
 
 更完整的本地联调、容器部署、1Panel 和 Webhook 说明见 [docs/deployment.md](docs/deployment.md)。
 
@@ -217,7 +230,9 @@ Authorization: Bearer <webhook_shared_secret>
 Content-Type: application/json
 ```
 
-这个接口默认关闭。它接收 MuxMail 标准化后的 Provider Event，并可把消息从 `sent` 推进到 `delivered`、`bounced` 或 `complained`。
+这个接口默认关闭。开启条件是配置 `webhooks.enabled: true` 和 `webhooks.shared_secret_ref`。它接收 MuxMail 标准化后的 Provider Event，并可把消息从 `sent` 推进到 `delivered`、`bounced` 或 `complained`。
+Webhook 事件必须带完整 provider account、channel 和 provider message 元数据，并且只有这些 identity 匹配同一 App、同一消息的已发送 attempt 时才会被接受。如果已发送 attempt 因服务商 accepted 响应没有返回 provider id 而记录了空 `provider_message_id`，认证后的 webhook 仍必须提供 `provider_message_id`，并匹配已记录的 provider account 和 channel。
+Lite JSONL 日志会保存脱敏后的来源摘要，而不是标准化请求里的原始 `event_payload`。
 
 Resend 原生 Webhook：
 
@@ -229,7 +244,7 @@ svix-timestamp: <unix-seconds>
 svix-signature: <signature>
 ```
 
-开启条件是配置 `webhooks.resend_secret_ref`。MuxMail 会校验 Svix 签名，并映射 `email.delivered`、`email.bounced`、`email.complained`。
+开启条件是配置 `webhooks.enabled: true` 和 `webhooks.resend_secret_ref`。MuxMail 会校验 Svix 签名，并映射 `email.delivered`、`email.bounced`、`email.complained`。
 
 Brevo 原生 Webhook：
 
@@ -239,11 +254,12 @@ Authorization: Bearer <brevo_webhook_token>
 Content-Type: application/json
 ```
 
-开启条件是配置 `webhooks.brevo_token_ref`。MuxMail 会映射 Brevo 的 `delivered`、`hardBounce` 和 `spam` 事件，并从 Brevo tags 中取回 MuxMail 元数据。
+开启条件是配置 `webhooks.enabled: true` 和 `webhooks.brevo_token_ref`。MuxMail 会映射 Brevo 的 `delivered`、`hardBounce` 和 `spam` 事件，从 Brevo tags 中取回 MuxMail 元数据，并使用 Brevo `ts_event` 作为 UTC 事件时间。
 
-当 Webhook Payload 中包含收件人邮箱时，bounce 和 complaint 事件会自动 upsert 到 `suppression.yaml`。
+bounce 和 complaint 事件必须提供合法的单个收件人邮箱，并会自动 upsert 到 `suppression.yaml`。
 收件人邮箱只用于退信名单更新，不会写入 JSONL 日志。
-具有相同 message/app/provider/provider message/event type/occurred-at 组合的重复事件会被忽略。
+具有相同 app/message/provider/provider account/provider channel/provider message/event type/occurred-at 组合的重复事件不会再次追加事件记录，但仍可重放幂等 suppression 更新和单调状态修复。
+迟到的 delivered 事件不会把已经 bounced 或 complained 的消息回滚为 delivered，但事件本身仍会记录。
 
 健康检查接口：
 

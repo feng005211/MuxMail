@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/muxmail/muxmail/internal/domain"
 )
@@ -34,6 +35,10 @@ func (r *Runtime) processFailedMessageList(httpRequest *http.Request) (messageLi
 	auth, err := r.auth.AuthenticateHeader(httpRequest.Header.Get("Authorization"))
 	if err != nil {
 		return messageListResponse{}, err
+	}
+
+	if strings.TrimSpace(httpRequest.URL.Query().Get("status")) != "" {
+		return messageListResponse{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidQuery, Message: "status is not supported on failed message list"}
 	}
 
 	filter, err := parseMessageListFilter(httpRequest)

@@ -34,6 +34,21 @@ func TestProviderResolverFromConfigSendsBrevoSMTPWithMetadata(t *testing.T) {
 	assertProviderResolverSendsSMTPWithMetadata(t, domain.ProviderBrevo, "brevo_main", "brevo_auth_smtp")
 }
 
+func TestProviderResolverFromConfigSendsSMTPWithChannelPasswordRef(t *testing.T) {
+	assertProviderResolverSendsSMTPWithMetadata(
+		t,
+		domain.ProviderResend,
+		"resend_main",
+		"resend_auth_smtp",
+		func(providerName domain.Provider, accountCode string, channelCode string, port int) *config.Config {
+			cfg := testSMTPResolverConfig(providerName, accountCode, channelCode, port)
+			cfg.ProviderAccounts[0].Credentials = map[string]string{}
+			cfg.ProviderChannels[0].SMTP.PasswordRef = "plain:smtp-secret"
+			return cfg
+		},
+	)
+}
+
 func TestProviderResolverFromConfigSendsResendAPIWithMetadata(t *testing.T) {
 	assertProviderResolverSendsAPIWithMetadata(
 		t,
@@ -144,7 +159,7 @@ func assertProviderResolverSendsAPIWithMetadata(t *testing.T, providerName domai
 	assertRecordValue(t, sentAttempt, "provider_message_id", providerMessageID)
 }
 
-func assertProviderResolverSendsSMTPWithMetadata(t *testing.T, providerName domain.Provider, accountCode string, channelCode string) {
+func assertProviderResolverSendsSMTPWithMetadata(t *testing.T, providerName domain.Provider, accountCode string, channelCode string, configBuilders ...func(domain.Provider, string, string, int) *config.Config) {
 	t.Helper()
 
 	server := newWorkerSMTPServer(t)
@@ -155,8 +170,12 @@ func assertProviderResolverSendsSMTPWithMetadata(t *testing.T, providerName doma
 		t.Fatalf("parse smtp port: %v", err)
 	}
 
+	configBuilder := testSMTPResolverConfig
+	if len(configBuilders) > 0 {
+		configBuilder = configBuilders[0]
+	}
 	resolver, err := NewProviderResolverFromConfig(
-		testSMTPResolverConfig(providerName, accountCode, channelCode, port),
+		configBuilder(providerName, accountCode, channelCode, port),
 		config.NewSecretResolver(),
 		WithSMTPTransportOptions(
 			provider.WithoutSMTPPortRequirement(),

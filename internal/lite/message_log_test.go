@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func TestMessageLogAppendAttemptRecord(t *testing.T) {
 
 	attempt := domain.Attempt{
 		MessageID:           "msg_01ABC",
+		AppCode:             "project_a",
 		AttemptNo:           1,
 		Provider:            domain.ProviderResend,
 		ProviderAccountCode: "resend_main",
@@ -70,7 +72,7 @@ func TestMessageLogAppendAttemptRecord(t *testing.T) {
 	}
 
 	line := readSingleLine(t, filepath.Join(dir, attemptsFilename))
-	want := `{"ts":"2026-05-28T03:04:05.123456789Z","message_id":"msg_01ABC","attempt_no":1,"provider":"resend","provider_account":"resend_main","provider_channel":"resend_auth_api","transport":"api","status":"sent","failure_class":"","error_code":"","provider_message_id":"provider_123","duration_ms":42}`
+	want := `{"ts":"2026-05-28T03:04:05.123456789Z","message_id":"msg_01ABC","app":"project_a","attempt_no":1,"provider":"resend","provider_account":"resend_main","provider_channel":"resend_auth_api","transport":"api","status":"sent","failure_class":"","error_code":"","error_message":"","provider_message_id":"provider_123","duration_ms":42}`
 	if line != want {
 		t.Fatalf("attempt record mismatch:\nwant %s\ngot  %s", want, line)
 	}
@@ -150,6 +152,147 @@ func TestMessageLogHasProviderEvent(t *testing.T) {
 	}
 }
 
+func TestMessageLogAppendProviderEventOnceIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLogWithEvents(t, dir, 1<<20)
+	defer log.Close()
+
+	event := domain.ProviderEvent{
+		MessageID:           "msg_01ABC",
+		AppCode:             "project_a",
+		Provider:            domain.ProviderResend,
+		ProviderAccountCode: "resend_main",
+		ProviderChannelCode: "resend_auth_api",
+		ProviderMessageID:   "provider_123",
+		EventType:           domain.ProviderEventDelivered,
+		EventPayload:        `{"redacted":true}`,
+		OccurredAt:          "2026-05-28T03:00:00Z",
+	}
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	appended := make(chan bool, 16)
+	errs := make(chan error, 16)
+	for index := 0; index < cap(appended); index++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			ok, err := log.AppendProviderEventOnce(event)
+			if err != nil {
+				errs <- err
+				return
+			}
+			appended <- ok
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(appended)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("append provider event once: %v", err)
+	}
+	appendedCount := 0
+	for ok := range appended {
+		if ok {
+			appendedCount++
+		}
+	}
+	if appendedCount != 1 {
+		t.Fatalf("expected exactly one append, got %d", appendedCount)
+	}
+	events := readJSONLLines(t, filepath.Join(dir, eventsFilename))
+	if len(events) != 1 {
+		t.Fatalf("expected one provider event record, got %d", len(events))
+	}
+}
+
+func TestMessageLogHasProviderEventReturnsErrorOnMalformedRecord(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLogWithEvents(t, dir, 1<<20)
+	defer log.Close()
+
+	event := domain.ProviderEvent{
+		MessageID:           "msg_01ABC",
+		AppCode:             "project_a",
+		Provider:            domain.ProviderResend,
+		ProviderAccountCode: "resend_main",
+		ProviderChannelCode: "resend_auth_api",
+		ProviderMessageID:   "provider_123",
+		EventType:           domain.ProviderEventDelivered,
+		EventPayload:        `{"redacted":true}`,
+		OccurredAt:          "2026-05-28T03:00:00Z",
+	}
+	if err := os.WriteFile(filepath.Join(dir, eventsFilename), []byte("{bad json}\n"), filePerm); err != nil {
+		t.Fatalf("write provider event log: %v", err)
+	}
+
+	_, err := log.HasProviderEvent(event)
+	if err == nil {
+		t.Fatal("expected malformed provider event log record to fail")
+	}
+	if !strings.Contains(err.Error(), "decode provider event log record") {
+		t.Fatalf("expected provider event decode error, got %v", err)
+	}
+}
+
+func TestMessageLogHasProviderEventReturnsErrorOnInvalidAuditFields(t *testing.T) {
+	event := domain.ProviderEvent{
+		MessageID:           "msg_01ABC",
+		AppCode:             "project_a",
+		Provider:            domain.ProviderResend,
+		ProviderAccountCode: "resend_main",
+		ProviderChannelCode: "resend_auth_api",
+		ProviderMessageID:   "provider_123",
+		EventType:           domain.ProviderEventDelivered,
+		EventPayload:        `{"redacted":true}`,
+		OccurredAt:          "2026-05-28T03:00:00Z",
+	}
+
+	tests := []struct {
+		name      string
+		line      string
+		wantError string
+	}{
+		{
+			name:      "invalid timestamp",
+			line:      `{"ts":"not-a-time","message_id":"msg_01ABC","app":"project_a","provider":"resend","provider_account":"resend_main","provider_channel":"resend_auth_api","provider_message_id":"provider_123","event_type":"delivered","event_payload":"{\"redacted\":true}","occurred_at":"2026-05-28T03:00:00Z"}`,
+			wantError: "decode provider event log timestamp",
+		},
+		{
+			name:      "missing provider message id",
+			line:      `{"ts":"2026-05-28T03:04:05.123456789Z","message_id":"msg_01ABC","app":"project_a","provider":"resend","provider_account":"resend_main","provider_channel":"resend_auth_api","event_type":"delivered","event_payload":"{\"redacted\":true}","occurred_at":"2026-05-28T03:00:00Z"}`,
+			wantError: "required fields are invalid",
+		},
+		{
+			name:      "invalid occurred at",
+			line:      `{"ts":"2026-05-28T03:04:05.123456789Z","message_id":"msg_01ABC","app":"project_a","provider":"resend","provider_account":"resend_main","provider_channel":"resend_auth_api","provider_message_id":"provider_123","event_type":"delivered","event_payload":"{\"redacted\":true}","occurred_at":"2026-05-28 03:00:00"}`,
+			wantError: "required fields are invalid",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			log := openTestMessageLogWithEvents(t, dir, 1<<20)
+			defer log.Close()
+
+			if err := os.WriteFile(filepath.Join(dir, eventsFilename), []byte(tt.line+"\n"), filePerm); err != nil {
+				t.Fatalf("write provider event log: %v", err)
+			}
+
+			_, err := log.HasProviderEvent(event)
+			if err == nil {
+				t.Fatal("expected invalid provider event audit record to fail")
+			}
+			if !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantError, err)
+			}
+		})
+	}
+}
+
 func TestMessageLogListProviderEvents(t *testing.T) {
 	dir := t.TempDir()
 	log := openTestMessageLogWithEvents(t, dir, 1<<20)
@@ -192,6 +335,25 @@ func TestMessageLogListProviderEvents(t *testing.T) {
 	}
 	if events[0].Provider != domain.ProviderResend || events[1].Provider != domain.ProviderBrevo {
 		t.Fatalf("unexpected provider event metadata: %+v", events)
+	}
+}
+
+func TestMessageLogListProviderEventsReturnsErrorOnInvalidAuditFields(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLogWithEvents(t, dir, 1<<20)
+	defer log.Close()
+
+	line := `{"ts":"2026-05-28T03:04:05.123456789Z","message_id":"msg_01ABC","app":"project_a","provider":"resend","provider_account":"resend_main","provider_channel":"resend_auth_api","event_type":"delivered","event_payload":"{\"redacted\":true}","occurred_at":"2026-05-28T03:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(dir, eventsFilename), []byte(line+"\n"), filePerm); err != nil {
+		t.Fatalf("write provider event log: %v", err)
+	}
+
+	_, err := log.ListProviderEvents("project_a", "msg_01ABC")
+	if err == nil {
+		t.Fatal("expected invalid provider event audit record to fail")
+	}
+	if !strings.Contains(err.Error(), "required fields are invalid") {
+		t.Fatalf("expected provider event required field error, got %v", err)
 	}
 }
 
@@ -251,6 +413,37 @@ func TestMessageLogListRecentProviderEvents(t *testing.T) {
 	}
 }
 
+func TestMessageLogListRecentProviderEventsReturnsErrorOnMalformedRecord(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLogWithEvents(t, dir, 1<<20)
+	defer log.Close()
+
+	event := domain.ProviderEvent{
+		MessageID:           "msg_01ABC",
+		AppCode:             "project_a",
+		Provider:            domain.ProviderResend,
+		ProviderAccountCode: "resend_main",
+		ProviderChannelCode: "resend_auth_api",
+		ProviderMessageID:   "provider_123",
+		EventType:           domain.ProviderEventDelivered,
+		EventPayload:        `{"redacted":true}`,
+		OccurredAt:          "2026-05-28T03:00:00Z",
+	}
+	validLine := encodeProviderEventRecord(time.Date(2026, 5, 28, 3, 4, 5, 0, time.UTC), event)
+	data := append([]byte("{bad json}\n"), append(validLine, '\n')...)
+	if err := os.WriteFile(filepath.Join(dir, eventsFilename), data, filePerm); err != nil {
+		t.Fatalf("write provider event log: %v", err)
+	}
+
+	_, err := log.ListRecentProviderEvents("project_a", ProviderEventListFilter{Limit: 10})
+	if err == nil {
+		t.Fatal("expected malformed provider event log record to fail")
+	}
+	if !strings.Contains(err.Error(), "decode provider event log record") {
+		t.Fatalf("expected provider event decode error, got %v", err)
+	}
+}
+
 func TestMessageLogListAttempts(t *testing.T) {
 	dir := t.TempDir()
 	log := openTestMessageLog(t, dir, 1<<20)
@@ -258,6 +451,7 @@ func TestMessageLogListAttempts(t *testing.T) {
 
 	first := domain.Attempt{
 		MessageID:           "msg_01ABC",
+		AppCode:             "project_a",
 		AttemptNo:           1,
 		Provider:            domain.ProviderResend,
 		ProviderAccountCode: "resend_main",
@@ -277,7 +471,7 @@ func TestMessageLogListAttempts(t *testing.T) {
 		t.Fatalf("append second attempt record: %v", err)
 	}
 
-	attempts, err := log.ListAttempts("msg_01ABC")
+	attempts, err := log.ListAttempts("project_a", "msg_01ABC")
 	if err != nil {
 		t.Fatalf("list attempts: %v", err)
 	}
@@ -289,6 +483,199 @@ func TestMessageLogListAttempts(t *testing.T) {
 	}
 	if attempts[1].ProviderMessageID != "provider_123" || attempts[1].DurationMS != 42 {
 		t.Fatalf("unexpected attempt metadata: %+v", attempts[1])
+	}
+}
+
+func TestMessageLogListAttemptsPreservesSafeErrorMessage(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLog(t, dir, 1<<20)
+	defer log.Close()
+
+	failed := domain.Attempt{
+		MessageID:           "msg_01ABC",
+		AppCode:             "project_a",
+		AttemptNo:           1,
+		Provider:            domain.ProviderResend,
+		ProviderAccountCode: "resend_main",
+		ProviderChannelCode: "resend_auth_api",
+		Transport:           domain.TransportAPI,
+		Status:              domain.AttemptStatusFailed,
+		FailureClass:        domain.FailureClassTemporary,
+		ErrorCode:           domain.ErrorCodeProviderUnavailable,
+		ErrorMessage:        "provider request failed",
+		DurationMS:          42,
+	}
+	if err := log.AppendAttempt(failed); err != nil {
+		t.Fatalf("append failed attempt record: %v", err)
+	}
+
+	attempts, err := log.ListAttempts("project_a", "msg_01ABC")
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("expected one attempt record, got %+v", attempts)
+	}
+	if attempts[0].ErrorMessage != "provider request failed" {
+		t.Fatalf("expected failed attempt error message, got %+v", attempts[0])
+	}
+}
+
+func TestMessageLogListAttemptsAllowsUnresolvedChannelFailure(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLog(t, dir, 1<<20)
+	defer log.Close()
+
+	failed := domain.Attempt{
+		MessageID:           "msg_01ABC",
+		AppCode:             "project_a",
+		AttemptNo:           1,
+		ProviderChannelCode: "missing_primary",
+		Status:              domain.AttemptStatusFailed,
+		FailureClass:        domain.FailureClassChannel,
+		ErrorCode:           domain.ErrorCodeProviderUnavailable,
+		ErrorMessage:        "provider channel unavailable",
+	}
+	if err := log.AppendAttempt(failed); err != nil {
+		t.Fatalf("append unresolved channel attempt: %v", err)
+	}
+
+	attempts, err := log.ListAttempts("project_a", "msg_01ABC")
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("expected one attempt record, got %+v", attempts)
+	}
+	if attempts[0].Provider != "" || attempts[0].Transport != "" || attempts[0].ProviderChannelCode != "missing_primary" {
+		t.Fatalf("unexpected unresolved channel metadata: %+v", attempts[0])
+	}
+}
+
+func TestMessageLogListAttemptsRejectsIncompleteProviderIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+	}{
+		{
+			name: "sent attempt missing account",
+			line: `{"ts":"2026-05-28T03:04:05.123456789Z","message_id":"msg_01ABC","app":"project_a","attempt_no":1,"provider":"resend","provider_account":"","provider_channel":"resend_auth_api","transport":"api","status":"sent","failure_class":"","error_code":"","error_message":"","provider_message_id":"provider_123","duration_ms":42}`,
+		},
+		{
+			name: "sent attempt missing channel",
+			line: `{"ts":"2026-05-28T03:04:05.123456789Z","message_id":"msg_01ABC","app":"project_a","attempt_no":1,"provider":"resend","provider_account":"resend_main","provider_channel":"","transport":"api","status":"sent","failure_class":"","error_code":"","error_message":"","provider_message_id":"provider_123","duration_ms":42}`,
+		},
+		{
+			name: "unresolved channel failure missing selected channel",
+			line: `{"ts":"2026-05-28T03:04:05.123456789Z","message_id":"msg_01ABC","app":"project_a","attempt_no":1,"provider":"","provider_account":"","provider_channel":"","transport":"","status":"failed","failure_class":"channel_failure","error_code":"provider_unavailable","error_message":"provider channel unavailable","provider_message_id":"","duration_ms":0}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			log := openTestMessageLog(t, dir, 1<<20)
+			defer log.Close()
+
+			if err := os.WriteFile(filepath.Join(dir, attemptsFilename), []byte(tt.line+"\n"), filePerm); err != nil {
+				t.Fatalf("write attempt log: %v", err)
+			}
+
+			_, err := log.ListAttempts("project_a", "msg_01ABC")
+			if err == nil {
+				t.Fatal("expected incomplete provider identity to fail")
+			}
+			if !strings.Contains(err.Error(), "required fields are invalid") {
+				t.Fatalf("expected required field error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestMessageLogListAttemptsIsAppScoped(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLog(t, dir, 1<<20)
+	defer log.Close()
+
+	first := domain.Attempt{
+		MessageID:           "msg_shared",
+		AppCode:             "project_a",
+		AttemptNo:           1,
+		Provider:            domain.ProviderResend,
+		ProviderAccountCode: "resend_main",
+		ProviderChannelCode: "resend_auth_api",
+		Transport:           domain.TransportAPI,
+		Status:              domain.AttemptStatusSent,
+		FailureClass:        domain.FailureClassNone,
+		ProviderMessageID:   "provider_a",
+	}
+	second := first
+	second.AppCode = "project_b"
+	second.ProviderMessageID = "provider_b"
+	if err := log.AppendAttempt(first); err != nil {
+		t.Fatalf("append first app attempt: %v", err)
+	}
+	if err := log.AppendAttempt(second); err != nil {
+		t.Fatalf("append second app attempt: %v", err)
+	}
+
+	attempts, err := log.ListAttempts("project_a", "msg_shared")
+	if err != nil {
+		t.Fatalf("list app-scoped attempts: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].ProviderMessageID != "provider_a" {
+		t.Fatalf("expected only project_a attempt, got %+v", attempts)
+	}
+}
+
+func TestMessageLogListAttemptsIgnoresLegacyRecordsWithoutApp(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLog(t, dir, 1<<20)
+	defer log.Close()
+
+	legacyLine := `{"ts":"2026-05-28T03:04:05.123456789Z","message_id":"msg_legacy","attempt_no":1,"provider":"resend","provider_account":"resend_main","provider_channel":"resend_auth_api","transport":"api","status":"sent","failure_class":"","error_code":"","provider_message_id":"provider_legacy","duration_ms":42}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, attemptsFilename), []byte(legacyLine), 0o600); err != nil {
+		t.Fatalf("write legacy attempt log: %v", err)
+	}
+
+	attempts, err := log.ListAttempts("project_a", "msg_legacy")
+	if err != nil {
+		t.Fatalf("list attempts with legacy records: %v", err)
+	}
+	if len(attempts) != 0 {
+		t.Fatalf("expected legacy app-less attempts to be ignored, got %+v", attempts)
+	}
+}
+
+func TestMessageLogListAttemptsReturnsErrorOnMalformedRecord(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLog(t, dir, 1<<20)
+	defer log.Close()
+
+	attempt := domain.Attempt{
+		MessageID:           "msg_01ABC",
+		AppCode:             "project_a",
+		AttemptNo:           1,
+		Provider:            domain.ProviderResend,
+		ProviderAccountCode: "resend_main",
+		ProviderChannelCode: "resend_auth_api",
+		Transport:           domain.TransportAPI,
+		Status:              domain.AttemptStatusSent,
+		FailureClass:        domain.FailureClassNone,
+		ProviderMessageID:   "provider_123",
+	}
+	validLine := encodeAttemptRecord(time.Date(2026, 5, 28, 3, 4, 5, 0, time.UTC), attempt)
+	data := append([]byte("{bad json}\n"), append(validLine, '\n')...)
+	if err := os.WriteFile(filepath.Join(dir, attemptsFilename), data, filePerm); err != nil {
+		t.Fatalf("write attempt log: %v", err)
+	}
+
+	_, err := log.ListAttempts("project_a", "msg_01ABC")
+	if err == nil {
+		t.Fatal("expected malformed attempt log record to fail")
+	}
+	if !strings.Contains(err.Error(), "decode attempt log record") {
+		t.Fatalf("expected attempt decode error, got %v", err)
 	}
 }
 
@@ -321,6 +708,45 @@ func TestMessageLogListLatestMessages(t *testing.T) {
 	}
 	if messages[0].MessageID != "msg_01BBB" || messages[1].MessageID != "msg_01AAA" {
 		t.Fatalf("expected latest messages to be sorted descending, got %+v", messages)
+	}
+}
+
+func TestMessageLogListLatestMessagesReturnsErrorOnMalformedRecord(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLog(t, dir, 1<<20)
+	defer log.Close()
+
+	validLine := encodeMessageRecord(time.Date(2026, 5, 28, 3, 4, 5, 0, time.UTC), testMessage())
+	data := append([]byte("{bad json}\n"), append(validLine, '\n')...)
+	if err := os.WriteFile(filepath.Join(dir, messagesFilename), data, filePerm); err != nil {
+		t.Fatalf("write message log: %v", err)
+	}
+
+	_, err := log.ListLatestMessages("project_a", MessageListFilter{})
+	if err == nil {
+		t.Fatal("expected malformed message log record to fail")
+	}
+	if !strings.Contains(err.Error(), "decode message log record") {
+		t.Fatalf("expected message decode error, got %v", err)
+	}
+}
+
+func TestMessageLogListLatestMessagesIgnoresLegacyRecordsWithoutApp(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLog(t, dir, 1<<20)
+	defer log.Close()
+
+	legacyLine := `{"ts":"2026-05-28T03:04:05.123456789Z","request_id":"req_legacy","message_id":"msg_legacy","api_key_name":"default","scene":"register_code","to_domain":"example.com","to_hash":"hash","locale":"en-US","status":"queued","error_code":"","error_message":""}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, messagesFilename), []byte(legacyLine), 0o600); err != nil {
+		t.Fatalf("write legacy message log: %v", err)
+	}
+
+	messages, err := log.ListLatestMessages("project_a", MessageListFilter{})
+	if err != nil {
+		t.Fatalf("list latest messages with legacy records: %v", err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("expected app-less legacy messages to be ignored, got %+v", messages)
 	}
 }
 
@@ -361,6 +787,52 @@ func TestMessageLogListLatestMessagesFiltersAndLimits(t *testing.T) {
 	}
 	if len(messages) != 1 || messages[0].MessageID != "msg_01BBB" {
 		t.Fatalf("expected one filtered message, got %+v", messages)
+	}
+}
+
+func TestMessageLogListLatestMessagesUsesAppendOrderForSameMessage(t *testing.T) {
+	dir := t.TempDir()
+	times := []time.Time{
+		time.Date(2026, 5, 28, 3, 4, 5, 0, time.UTC),
+		time.Date(2026, 5, 28, 3, 4, 4, 0, time.UTC),
+	}
+	index := 0
+	log, err := NewMessageLog(MessageLogConfig{
+		Dir:        dir,
+		MaxBytes:   1 << 20,
+		MaxBackups: 2,
+		Now: func() time.Time {
+			now := times[index]
+			if index < len(times)-1 {
+				index++
+			}
+			return now
+		},
+	})
+	if err != nil {
+		t.Fatalf("open message log: %v", err)
+	}
+	defer log.Close()
+
+	message := testMessage()
+	message.Status = domain.MessageStatusSent
+	if err := log.AppendMessage(message); err != nil {
+		t.Fatalf("append sent message: %v", err)
+	}
+	message.Status = domain.MessageStatusDelivered
+	if err := log.AppendMessage(message); err != nil {
+		t.Fatalf("append delivered message: %v", err)
+	}
+
+	messages, err := log.ListLatestMessages("project_a", MessageListFilter{})
+	if err != nil {
+		t.Fatalf("list latest messages: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected one latest message, got %+v", messages)
+	}
+	if messages[0].Status != domain.MessageStatusDelivered {
+		t.Fatalf("expected append-latest delivered status, got %+v", messages[0])
 	}
 }
 
@@ -460,18 +932,42 @@ func TestMessageLogFindLatestMessageScansRotatedBackups(t *testing.T) {
 	}
 }
 
-func TestMessageLogFindLatestMessageRejectsMalformedRecord(t *testing.T) {
+func TestMessageLogFindLatestMessageReturnsErrorOnMalformedRecord(t *testing.T) {
 	dir := t.TempDir()
 	log := openTestMessageLog(t, dir, 1<<20)
 	defer log.Close()
 
-	if err := os.WriteFile(filepath.Join(dir, messagesFilename), []byte("{bad json}\n"), filePerm); err != nil {
-		t.Fatalf("write malformed record: %v", err)
+	validLine := encodeMessageRecord(time.Date(2026, 5, 28, 3, 4, 5, 0, time.UTC), testMessage())
+	data := append([]byte("{bad json}\n"), append(validLine, '\n')...)
+	if err := os.WriteFile(filepath.Join(dir, messagesFilename), data, filePerm); err != nil {
+		t.Fatalf("write message log: %v", err)
 	}
 
 	_, _, err := log.FindLatestMessage("project_a", "msg_01ABC")
 	if err == nil {
-		t.Fatal("expected malformed record to fail")
+		t.Fatal("expected malformed message log record to fail")
+	}
+	if !strings.Contains(err.Error(), "decode message log record") {
+		t.Fatalf("expected message decode error, got %v", err)
+	}
+}
+
+func TestMessageLogFindLatestMessageIgnoresLegacyRecordsWithoutApp(t *testing.T) {
+	dir := t.TempDir()
+	log := openTestMessageLog(t, dir, 1<<20)
+	defer log.Close()
+
+	legacyLine := `{"ts":"2026-05-28T03:04:05.123456789Z","request_id":"req_legacy","message_id":"msg_legacy","api_key_name":"default","scene":"register_code","to_domain":"example.com","to_hash":"hash","locale":"en-US","status":"queued","error_code":"","error_message":""}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, messagesFilename), []byte(legacyLine), 0o600); err != nil {
+		t.Fatalf("write legacy message log: %v", err)
+	}
+
+	_, found, err := log.FindLatestMessage("project_a", "msg_legacy")
+	if err != nil {
+		t.Fatalf("find latest message with legacy records: %v", err)
+	}
+	if found {
+		t.Fatal("expected app-less legacy message not to be visible to app-scoped lookup")
 	}
 }
 
@@ -577,4 +1073,27 @@ func readSingleLine(t *testing.T, path string) string {
 	}
 
 	return lines[0]
+}
+
+func readJSONLLines(t *testing.T, path string) []map[string]any {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read jsonl %s: %v", path, err)
+	}
+	rawLines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	records := make([]map[string]any, 0, len(rawLines))
+	for _, line := range rawLines {
+		if line == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("decode jsonl line %q: %v", line, err)
+		}
+		records = append(records, record)
+	}
+
+	return records
 }

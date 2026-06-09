@@ -6,8 +6,10 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/muxmail/muxmail/internal/domain"
+	"github.com/muxmail/muxmail/internal/lite"
 )
 
 type providerEventRequest struct {
@@ -28,6 +30,8 @@ type providerEventResponse struct {
 	App       string               `json:"app"`
 	Status    domain.MessageStatus `json:"status"`
 }
+
+const normalizedProviderEventPayload = `{"source":"generic"}`
 
 func (r *Runtime) handleProviderEvent(w http.ResponseWriter, httpRequest *http.Request) {
 	if httpRequest.Method == http.MethodGet {
@@ -77,6 +81,9 @@ func (r *Runtime) processProviderEvent(httpRequest *http.Request) (providerEvent
 }
 
 func (r *Runtime) applyProviderEvent(event domain.ProviderEvent) (providerEventResponse, error) {
+	r.eventMu.Lock()
+	defer r.eventMu.Unlock()
+
 	snapshot, found, err := r.messageLog.FindLatestMessage(event.AppCode, event.MessageID)
 	if err != nil {
 		return providerEventResponse{}, fmt.Errorf("find message for provider event: %w", err)
@@ -84,11 +91,26 @@ func (r *Runtime) applyProviderEvent(event domain.ProviderEvent) (providerEventR
 	if !found {
 		return providerEventResponse{}, APIError{Code: domain.ErrorCodeMessageNotFound, Message: "message not found"}
 	}
-	duplicate, err := r.messageLog.HasProviderEvent(event)
-	if err != nil {
-		return providerEventResponse{}, fmt.Errorf("check duplicate provider event: %w", err)
+	if err := r.validateProviderEventAttempt(event); err != nil {
+		return providerEventResponse{}, err
 	}
-	if duplicate {
+	if err := validateProviderEventRecipientMatchesMessage(snapshot, event); err != nil {
+		return providerEventResponse{}, err
+	}
+	appended, err := r.messageLog.AppendProviderEventOnce(event)
+	if err != nil {
+		return providerEventResponse{}, fmt.Errorf("append provider event: %w", err)
+	}
+	if !appended {
+		if err := r.applySuppressionForEvent(event); err != nil {
+			return providerEventResponse{}, fmt.Errorf("apply suppression for duplicate provider event: %w", err)
+		}
+		if nextStatus, ok := nextProviderEventMessageStatus(snapshot.Status, event.EventType); ok {
+			if err := r.appendProviderEventMessageStatus(snapshot, nextStatus); err != nil {
+				return providerEventResponse{}, fmt.Errorf("append duplicate provider event message status: %w", err)
+			}
+			snapshot.Status = nextStatus
+		}
 		return providerEventResponse{
 			MessageID: event.MessageID,
 			App:       event.AppCode,
@@ -96,21 +118,140 @@ func (r *Runtime) applyProviderEvent(event domain.ProviderEvent) (providerEventR
 		}, nil
 	}
 
-	if err := r.messageLog.AppendProviderEvent(event); err != nil {
-		return providerEventResponse{}, fmt.Errorf("append provider event: %w", err)
-	}
+	r.recordProviderEventStat(snapshot, event)
 	if err := r.applySuppressionForEvent(event); err != nil {
 		return providerEventResponse{}, fmt.Errorf("apply suppression for provider event: %w", err)
 	}
-	if err := r.messageLog.AppendWebhookMessageStatus(snapshot, event); err != nil {
-		return providerEventResponse{}, fmt.Errorf("append provider event message status: %w", err)
+	if nextStatus, ok := nextProviderEventMessageStatus(snapshot.Status, event.EventType); ok {
+		if err := r.appendProviderEventMessageStatus(snapshot, nextStatus); err != nil {
+			return providerEventResponse{}, fmt.Errorf("append provider event message status: %w", err)
+		}
+		snapshot.Status = nextStatus
 	}
 
 	return providerEventResponse{
 		MessageID: event.MessageID,
 		App:       event.AppCode,
-		Status:    event.EventType.MessageStatus(),
+		Status:    snapshot.Status,
 	}, nil
+}
+
+func (r *Runtime) recordProviderEventStat(snapshot lite.MessageSnapshot, event domain.ProviderEvent) {
+	metric, ok := providerEventMetric(event.EventType)
+	if !ok {
+		return
+	}
+
+	_ = r.stats.Record(lite.StatsRecord{
+		AppCode:   snapshot.AppCode,
+		SceneCode: snapshot.SceneCode,
+		Metric:    metric,
+		Value:     1,
+	})
+}
+
+func validateProviderEventRecipientMatchesMessage(snapshot lite.MessageSnapshot, event domain.ProviderEvent) error {
+	if !requiresSuppression(event.EventType) {
+		return nil
+	}
+	normalizedEmail, ok := domain.NormalizeAddrSpecEmail(event.RecipientEmail)
+	if !ok {
+		return domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "recipient email is invalid"}
+	}
+	if snapshot.ToHash == "" || domain.ToHash(snapshot.AppCode, normalizedEmail) != snapshot.ToHash {
+		return domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "provider event recipient does not match message"}
+	}
+
+	return nil
+}
+
+func (r *Runtime) validateProviderEventAttempt(event domain.ProviderEvent) error {
+	attempts, err := r.messageLog.ListAttempts(event.AppCode, event.MessageID)
+	if err != nil {
+		return fmt.Errorf("list attempts for provider event: %w", err)
+	}
+	for _, attempt := range latestAttemptsByNumber(attempts) {
+		if attempt.Status != domain.AttemptStatusSent {
+			continue
+		}
+		if attempt.Provider == event.Provider &&
+			attempt.ProviderAccountCode == event.ProviderAccountCode &&
+			attempt.ProviderChannelCode == event.ProviderChannelCode {
+			if attempt.ProviderMessageID == event.ProviderMessageID {
+				return nil
+			}
+			if attempt.ProviderMessageID == "" {
+				// Some accepted API responses can omit the provider id; the authenticated webhook
+				// still carries the MuxMail message tags and concrete provider channel identity.
+				return nil
+			}
+		}
+	}
+
+	return domain.RequestValidationError{
+		Code:    domain.ErrorCodeInvalidJSON,
+		Message: "provider event does not match a sent attempt",
+	}
+}
+
+func latestAttemptsByNumber(attempts []lite.AttemptSnapshot) map[int]lite.AttemptSnapshot {
+	latest := make(map[int]lite.AttemptSnapshot)
+	for _, attempt := range attempts {
+		latest[attempt.AttemptNo] = attempt
+	}
+
+	return latest
+}
+
+func (r *Runtime) appendProviderEventMessageStatus(snapshot lite.MessageSnapshot, status domain.MessageStatus) error {
+	event := domain.ProviderEvent{EventType: eventTypeForMessageStatus(status)}
+	return r.messageLog.AppendWebhookMessageStatus(snapshot, event)
+}
+
+func nextProviderEventMessageStatus(current domain.MessageStatus, eventType domain.ProviderEventType) (domain.MessageStatus, bool) {
+	next := eventType.MessageStatus()
+	if next == "" || current == next {
+		return "", false
+	}
+	switch current {
+	case domain.MessageStatusFailed, domain.MessageStatusComplained:
+		return "", false
+	case domain.MessageStatusBounced:
+		return next, next == domain.MessageStatusComplained
+	case domain.MessageStatusDelivered:
+		if next == domain.MessageStatusDelivered {
+			return "", false
+		}
+		return next, next == domain.MessageStatusBounced || next == domain.MessageStatusComplained
+	default:
+		return next, true
+	}
+}
+
+func eventTypeForMessageStatus(status domain.MessageStatus) domain.ProviderEventType {
+	switch status {
+	case domain.MessageStatusDelivered:
+		return domain.ProviderEventDelivered
+	case domain.MessageStatusBounced:
+		return domain.ProviderEventBounced
+	case domain.MessageStatusComplained:
+		return domain.ProviderEventComplained
+	default:
+		return ""
+	}
+}
+
+func providerEventMetric(eventType domain.ProviderEventType) (string, bool) {
+	switch eventType {
+	case domain.ProviderEventDelivered:
+		return lite.MetricProviderEventsDelivered, true
+	case domain.ProviderEventBounced:
+		return lite.MetricProviderEventsBounced, true
+	case domain.ProviderEventComplained:
+		return lite.MetricProviderEventsComplained, true
+	default:
+		return "", false
+	}
 }
 
 func decodeProviderEventRequest(body []byte) (domain.ProviderEvent, error) {
@@ -135,11 +276,17 @@ func decodeProviderEventRequest(body []byte) (domain.ProviderEvent, error) {
 		ProviderMessageID:   strings.TrimSpace(request.ProviderMessageID),
 		RecipientEmail:      strings.TrimSpace(request.RecipientEmail),
 		EventType:           request.EventType,
-		EventPayload:        request.EventPayload,
+		EventPayload:        normalizedProviderEventPayload,
 		OccurredAt:          strings.TrimSpace(request.OccurredAt),
 	}
 	if event.AppCode == "" || event.MessageID == "" {
 		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "app and message_id are required"}
+	}
+	if !isValidIdentifierFilter(event.AppCode) {
+		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "app is invalid"}
+	}
+	if !isValidMessageIDValue(event.MessageID) {
+		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "message_id is invalid"}
 	}
 	if !event.Provider.IsValid() {
 		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "provider is invalid"}
@@ -147,11 +294,63 @@ func decodeProviderEventRequest(body []byte) (domain.ProviderEvent, error) {
 	if !event.EventType.IsValid() {
 		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "event_type is invalid"}
 	}
-	if requiresSuppression(event.EventType) && domain.NormalizeEmail(event.RecipientEmail) == "" {
-		return domain.ProviderEvent{}, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "recipient_email is required for bounce and complaint events"}
+	if err := validateProviderEventIdentity(&event); err != nil {
+		return domain.ProviderEvent{}, err
+	}
+	if err := validateProviderEventRecipientEmail(event); err != nil {
+		return domain.ProviderEvent{}, err
 	}
 
 	return event, nil
+}
+
+func validateProviderEventIdentity(event *domain.ProviderEvent) error {
+	if event == nil {
+		return domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "provider event identity is required"}
+	}
+	event.ProviderAccountCode = strings.TrimSpace(event.ProviderAccountCode)
+	event.ProviderChannelCode = strings.TrimSpace(event.ProviderChannelCode)
+	event.ProviderMessageID = strings.TrimSpace(event.ProviderMessageID)
+	event.OccurredAt = strings.TrimSpace(event.OccurredAt)
+	if event.ProviderAccountCode == "" ||
+		event.ProviderChannelCode == "" ||
+		event.ProviderMessageID == "" ||
+		event.OccurredAt == "" {
+		return domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "provider account, channel, message id, and occurred_at are required"}
+	}
+	if !isValidIdentifierFilter(event.ProviderAccountCode) || !isValidIdentifierFilter(event.ProviderChannelCode) {
+		return domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "provider account or channel is invalid"}
+	}
+	occurredAt, err := normalizeProviderEventOccurredAt(event.OccurredAt)
+	if err != nil {
+		return domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "occurred_at must be RFC3339"}
+	}
+	event.OccurredAt = occurredAt
+
+	return nil
+}
+
+func normalizeProviderEventOccurredAt(value string) (string, error) {
+	occurredAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+	if err != nil {
+		return "", err
+	}
+
+	return occurredAt.UTC().Format(time.RFC3339Nano), nil
+}
+
+func validateProviderEventRecipientEmail(event domain.ProviderEvent) error {
+	if !requiresSuppression(event.EventType) {
+		return nil
+	}
+	if strings.TrimSpace(event.RecipientEmail) == "" {
+		return domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "recipient email is required for bounce and complaint events"}
+	}
+	if !isValidSingleAddrSpecEmail(event.RecipientEmail) {
+		return domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "recipient email is invalid"}
+	}
+
+	return nil
 }
 
 func (r *Runtime) applySuppressionForEvent(event domain.ProviderEvent) error {

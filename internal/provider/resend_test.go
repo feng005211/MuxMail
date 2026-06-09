@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/muxmail/muxmail/internal/domain"
 )
@@ -50,6 +51,21 @@ func TestResendAPIProviderAcceptedResponse(t *testing.T) {
 	assertResendTag(t, captured.Tags, "provider_channel", "resend_auth_api")
 }
 
+func TestResendAPIProviderTreats2xxWithoutMessageIDAsAccepted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	result := sendThroughResendTestServer(t, server, resendTestMessage(), nil)
+	if !result.IsAccepted() {
+		t.Fatalf("expected accepted response, got %+v", result)
+	}
+	if result.Accepted.ProviderMessageID != "" {
+		t.Fatalf("expected empty provider message id, got %q", result.Accepted.ProviderMessageID)
+	}
+}
+
 func TestResendAPIProviderMaps429ToTemporaryFailure(t *testing.T) {
 	server := resendErrorServer(http.StatusTooManyRequests, "rate_limit_exceeded", "slow down", "120")
 	defer server.Close()
@@ -58,6 +74,29 @@ func TestResendAPIProviderMaps429ToTemporaryFailure(t *testing.T) {
 	assertResendFailure(t, result, domain.FailureClassTemporary, domain.ErrorCodeProviderUnavailable)
 	if result.RetryAfterSeconds != 120 {
 		t.Fatalf("expected retry-after 120, got %d", result.RetryAfterSeconds)
+	}
+}
+
+func TestResendAPIProviderMapsHTTPDateRetryAfter(t *testing.T) {
+	now := time.Date(2026, 6, 9, 12, 30, 0, 0, time.UTC)
+	retryAfter := now.Add(2 * time.Second).Format(http.TimeFormat)
+	server := resendErrorServer(http.StatusTooManyRequests, "rate_limit_exceeded", "slow down", retryAfter)
+	defer server.Close()
+
+	provider := NewResendAPIProvider(
+		StaticSecretResolver{"resend_key": "secret"},
+		WithResendBaseURL(server.URL),
+		WithResendHTTPClient(server.Client()),
+		WithResendNow(func() time.Time { return now }),
+	)
+	result, err := provider.Send(context.Background(), resendTestRequest(resendTestMessage()))
+	if err != nil {
+		t.Fatalf("resend send returned error: %v", err)
+	}
+
+	assertResendFailure(t, result, domain.FailureClassTemporary, domain.ErrorCodeProviderUnavailable)
+	if result.RetryAfterSeconds != 2 {
+		t.Fatalf("expected retry-after 2, got %d", result.RetryAfterSeconds)
 	}
 }
 
@@ -101,8 +140,77 @@ func TestResendAPIProviderMapsAuthFailureToChannelFailure(t *testing.T) {
 	assertResendFailure(t, result, domain.FailureClassChannel, domain.ErrorCodeProviderUnavailable)
 }
 
+func TestResendAPIProviderRejectsInvalidAPIKeyValueBeforeRequest(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"resend_msg_123"}`))
+	}))
+	defer server.Close()
+
+	result, err := NewResendAPIProvider(
+		StaticSecretResolver{"resend_key": "secret\n"},
+		WithResendBaseURL(server.URL),
+		WithResendHTTPClient(server.Client()),
+	).Send(context.Background(), resendTestRequest(resendTestMessage()))
+	if err != nil {
+		t.Fatalf("resend send returned error: %v", err)
+	}
+	assertResendFailure(t, result, domain.FailureClassChannel, domain.ErrorCodeProviderUnavailable)
+	if requestCount != 0 {
+		t.Fatalf("expected invalid api key to stop before HTTP request, got %d requests", requestCount)
+	}
+}
+
+func TestResendAPIProviderRejectsInvalidRecipientBeforeRequest(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"resend_msg_123"}`))
+	}))
+	defer server.Close()
+
+	message := resendTestMessage()
+	message.ToEmail = "victim@example.com\r\nBcc: attacker@example.com"
+	result := sendThroughResendTestServer(t, server, message, nil)
+
+	assertResendFailure(t, result, domain.FailureClassMessagePermanent, domain.ErrorCodeInvalidRecipient)
+	if requestCount != 0 {
+		t.Fatalf("expected invalid recipient to stop before HTTP request, got %d requests", requestCount)
+	}
+}
+
+func TestResendAPIProviderRejectsInvalidFromNameBeforeRequest(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"resend_msg_123"}`))
+	}))
+	defer server.Close()
+
+	result := sendThroughResendTestServer(t, server, resendTestMessage(), func(request *SendRequest) {
+		request.Channel.FromName = "MuxMail\r\nBcc: attacker@example.com"
+	})
+
+	assertResendFailure(t, result, domain.FailureClassChannel, domain.ErrorCodeProviderUnavailable)
+	if requestCount != 0 {
+		t.Fatalf("expected invalid from name to stop before HTTP request, got %d requests", requestCount)
+	}
+}
+
 func TestResendAPIProviderMapsDomainFailureToChannelFailure(t *testing.T) {
 	server := resendErrorServer(http.StatusForbidden, "validation_error", "domain is not verified", "")
+	defer server.Close()
+
+	result := sendThroughResendTestServer(t, server, resendTestMessage(), nil)
+	assertResendFailure(t, result, domain.FailureClassChannel, domain.ErrorCodeProviderUnavailable)
+}
+
+func TestResendAPIProviderMapsSenderFailureToChannelFailure(t *testing.T) {
+	server := resendErrorServer(http.StatusBadRequest, "validation_error", "from address is not allowed", "")
 	defer server.Close()
 
 	result := sendThroughResendTestServer(t, server, resendTestMessage(), nil)

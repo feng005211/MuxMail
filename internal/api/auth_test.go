@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/muxmail/muxmail/internal/config"
@@ -30,6 +31,18 @@ func TestAuthenticatorAuthenticatesValidKey(t *testing.T) {
 	}
 }
 
+func TestAuthenticatorAcceptsCaseInsensitiveBearerScheme(t *testing.T) {
+	authenticator := openTestAuthenticator(t, nil, nil)
+
+	auth, err := authenticator.AuthenticateHeader("bearer " + testAPIKey)
+	if err != nil {
+		t.Fatalf("authenticate lower-case bearer key: %v", err)
+	}
+	if auth.App.Code != "project_a" || auth.APIKey.Name != "default" {
+		t.Fatalf("unexpected auth context: %+v", auth)
+	}
+}
+
 func TestAuthenticatorRejectsMissingAndInvalidAuth(t *testing.T) {
 	authenticator := openTestAuthenticator(t, nil, nil)
 
@@ -38,6 +51,7 @@ func TestAuthenticatorRejectsMissingAndInvalidAuth(t *testing.T) {
 		"Basic " + testAPIKey,
 		"Bearer short",
 		"Bearer " + testAPIKey + " extra",
+		"Bearer mk_test_invalid_key_123456_中文",
 		"Bearer mk_test_wrong_key_123456789",
 	}
 
@@ -46,6 +60,67 @@ func TestAuthenticatorRejectsMissingAndInvalidAuth(t *testing.T) {
 			_, err := authenticator.AuthenticateHeader(header)
 			assertAuthError(t, err, domain.ErrorCodeUnauthorized)
 		})
+	}
+}
+
+func TestNewAuthenticatorRejectsInvalidResolvedAPIKeyValue(t *testing.T) {
+	_, err := NewAuthenticator([]config.AppConfig{
+		{
+			Code:          "project_a",
+			Name:          "Project A",
+			DefaultLocale: "en-US",
+			AllowedLocales: []string{
+				"en-US",
+			},
+			APIKeys: []config.APIKeyConfig{
+				{Name: "default", KeyRef: "plain:short"},
+			},
+		},
+	}, config.NewSecretResolver())
+	if err == nil {
+		t.Fatal("expected invalid API key value to be rejected")
+	}
+	if !strings.Contains(err.Error(), "apps[0].api_keys[0]") {
+		t.Fatalf("expected error path without secret value, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "short") {
+		t.Fatalf("expected invalid API key error to omit secret value, got %q", err.Error())
+	}
+}
+
+func TestNewAuthenticatorRejectsDuplicateResolvedAPIKeyValue(t *testing.T) {
+	_, err := NewAuthenticator([]config.AppConfig{
+		{
+			Code:          "project_a",
+			Name:          "Project A",
+			DefaultLocale: "en-US",
+			AllowedLocales: []string{
+				"en-US",
+			},
+			APIKeys: []config.APIKeyConfig{
+				{Name: "default", KeyRef: "plain:" + testAPIKey},
+			},
+		},
+		{
+			Code:          "project_b",
+			Name:          "Project B",
+			DefaultLocale: "en-US",
+			AllowedLocales: []string{
+				"en-US",
+			},
+			APIKeys: []config.APIKeyConfig{
+				{Name: "default", KeyRef: "plain:" + testAPIKey},
+			},
+		},
+	}, config.NewSecretResolver())
+	if err == nil {
+		t.Fatal("expected duplicate API key value to be rejected")
+	}
+	if !strings.Contains(err.Error(), "apps[1].api_keys[0]") || !strings.Contains(err.Error(), "apps[0].api_keys[0]") {
+		t.Fatalf("expected duplicate error to identify both key paths, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), testAPIKey) {
+		t.Fatalf("expected duplicate API key error to omit secret value, got %q", err.Error())
 	}
 }
 
@@ -104,8 +179,28 @@ func TestAuthenticatorMiddlewareWritesUnauthorized(t *testing.T) {
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("expected status 401, got %d", recorder.Code)
 	}
-	if recorder.Body.String() != `{"error":{"code":"unauthorized","message":"unauthorized","request_id":""}}` {
+	if recorder.Body.String() != "{\"error\":{\"code\":\"unauthorized\",\"message\":\"unauthorized\",\"request_id\":\"\"}}\n" {
 		t.Fatalf("unexpected unauthorized body: %q", recorder.Body.String())
+	}
+}
+
+func TestAuthenticatorMiddlewareWritesAppDisabled(t *testing.T) {
+	disabled := false
+	authenticator := openTestAuthenticator(t, &disabled, nil)
+	handler := authenticator.Middleware(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		t.Fatalf("handler should not run")
+	}))
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/mail/send", nil)
+	request.Header.Set("Authorization", "Bearer "+testAPIKey)
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403, got %d", recorder.Code)
+	}
+	if recorder.Body.String() != "{\"error\":{\"code\":\"app_disabled\",\"message\":\"app disabled\",\"request_id\":\"\"}}\n" {
+		t.Fatalf("unexpected app disabled body: %q", recorder.Body.String())
 	}
 }
 

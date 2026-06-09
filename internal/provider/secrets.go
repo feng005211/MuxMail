@@ -27,3 +27,16 @@ func (r StaticSecretResolver) ResolveSecret(ref string) (string, error) {
 
 	return value, nil
 }
+
+func isVisibleASCIIWithoutWhitespaceSecret(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if char < 0x21 || char > 0x7E {
+			return false
+		}
+	}
+
+	return true
+}

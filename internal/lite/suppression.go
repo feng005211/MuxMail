@@ -1,10 +1,13 @@
 package lite
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -12,6 +15,8 @@ import (
 	"github.com/muxmail/muxmail/internal/domain"
 	"gopkg.in/yaml.v3"
 )
+
+var suppressionAppCodePattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$`)
 
 // SuppressionStore provides App-scoped recipient suppression lookups.
 type SuppressionStore struct {
@@ -48,8 +53,8 @@ func LoadSuppressionStore(path string) (*SuppressionStore, error) {
 		return nil, fmt.Errorf("read suppression file: %w", err)
 	}
 
-	var file suppressionYAML
-	if err := yaml.Unmarshal(data, &file); err != nil {
+	file, err := decodeSuppressionYAML(data)
+	if err != nil {
 		return nil, fmt.Errorf("parse suppression file: %w", err)
 	}
 
@@ -57,21 +62,29 @@ func LoadSuppressionStore(path string) (*SuppressionStore, error) {
 	store.path = path
 	for index, entry := range file.Entries {
 		appCode := strings.TrimSpace(entry.App)
-		normalizedEmail := domain.NormalizeEmail(strings.TrimSpace(entry.Email))
+		email := strings.TrimSpace(entry.Email)
+		normalizedEmail, emailOK := domain.NormalizeAddrSpecEmail(email)
 		reason := domain.SuppressionReason(entry.Reason)
 		if appCode == "" {
 			return nil, fmt.Errorf("suppression entry %d app is required", index)
 		}
-		if normalizedEmail == "" {
-			return nil, fmt.Errorf("suppression entry %d email is required", index)
+		if !isValidSuppressionAppCode(appCode) {
+			return nil, fmt.Errorf("suppression entry %d app is invalid", index)
+		}
+		if !emailOK {
+			return nil, fmt.Errorf("suppression entry %d email must be a valid single addr-spec", index)
 		}
 		if !reason.IsValid() {
 			return nil, fmt.Errorf("suppression entry %d reason must be hard_bounce, complaint, or manual", index)
 		}
 
-		store.entries[suppressionKey(appCode, normalizedEmail)] = domain.SuppressionEntry{
+		key := suppressionKey(appCode, normalizedEmail)
+		if _, exists := store.entries[key]; exists {
+			return nil, fmt.Errorf("suppression entry %d duplicates an earlier app and email", index)
+		}
+		store.entries[key] = domain.SuppressionEntry{
 			AppCode:         appCode,
-			Email:           strings.TrimSpace(entry.Email),
+			Email:           email,
 			NormalizedEmail: normalizedEmail,
 			Reason:          reason,
 		}
@@ -99,13 +112,20 @@ func (s *SuppressionStore) Add(entry domain.SuppressionEntry) (bool, error) {
 	}
 
 	appCode := strings.TrimSpace(entry.AppCode)
-	normalizedEmail := domain.NormalizeEmail(strings.TrimSpace(entry.NormalizedEmail))
-	if normalizedEmail == "" {
-		normalizedEmail = domain.NormalizeEmail(strings.TrimSpace(entry.Email))
-	}
 	email := strings.TrimSpace(entry.Email)
-	if appCode == "" || normalizedEmail == "" {
-		return false, fmt.Errorf("suppression entry app and email are required")
+	sourceEmail := email
+	if sourceEmail == "" {
+		sourceEmail = strings.TrimSpace(entry.NormalizedEmail)
+	}
+	normalizedEmail, emailOK := domain.NormalizeAddrSpecEmail(sourceEmail)
+	if appCode == "" {
+		return false, fmt.Errorf("suppression entry app is required")
+	}
+	if !isValidSuppressionAppCode(appCode) {
+		return false, fmt.Errorf("suppression entry app is invalid")
+	}
+	if !emailOK {
+		return false, fmt.Errorf("suppression entry email must be a valid single addr-spec")
 	}
 	if !entry.Reason.IsValid() {
 		return false, fmt.Errorf("suppression entry reason must be hard_bounce, complaint, or manual")
@@ -129,6 +149,14 @@ func (s *SuppressionStore) Add(entry domain.SuppressionEntry) (bool, error) {
 		if existing.Reason == normalizedEntry.Reason && existing.Email == normalizedEntry.Email {
 			return false, nil
 		}
+		if existing.Reason == domain.SuppressionReasonHardBounce && normalizedEntry.Reason == domain.SuppressionReasonComplaint {
+			s.entries[key] = normalizedEntry
+			if err := s.persistLocked(); err != nil {
+				s.entries[key] = existing
+				return false, err
+			}
+			return true, nil
+		}
 		return false, nil
 	}
 
@@ -147,7 +175,14 @@ func (s *SuppressionStore) List(appCode string, filter SuppressionListFilter) []
 		return []domain.SuppressionEntry{}
 	}
 
-	normalizedEmail := domain.NormalizeEmail(strings.TrimSpace(filter.Email))
+	var normalizedEmail string
+	if strings.TrimSpace(filter.Email) != "" {
+		var ok bool
+		normalizedEmail, ok = domain.NormalizeAddrSpecEmail(filter.Email)
+		if !ok {
+			return []domain.SuppressionEntry{}
+		}
+	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -188,8 +223,33 @@ type suppressionYAMLEntry struct {
 	Reason string `yaml:"reason"`
 }
 
+func decodeSuppressionYAML(data []byte) (suppressionYAML, error) {
+	var file suppressionYAML
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&file); err != nil {
+		if errors.Is(err, io.EOF) {
+			return file, nil
+		}
+		return suppressionYAML{}, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return suppressionYAML{}, fmt.Errorf("suppression file must contain a single YAML document")
+		}
+		return suppressionYAML{}, err
+	}
+
+	return file, nil
+}
+
 func suppressionKey(appCode string, normalizedEmail string) string {
 	return appCode + "\x00" + normalizedEmail
+}
+
+func isValidSuppressionAppCode(value string) bool {
+	return suppressionAppCodePattern.MatchString(value)
 }
 
 func (s *SuppressionStore) persistLocked() error {
@@ -221,9 +281,49 @@ func (s *SuppressionStore) persistLocked() error {
 	if err != nil {
 		return fmt.Errorf("marshal suppression file: %w", err)
 	}
-	if err := os.WriteFile(s.path, data, filePerm); err != nil {
+	if err := writeFileAtomically(s.path, data, filePerm); err != nil {
 		return fmt.Errorf("write suppression file: %w", err)
 	}
+
+	return nil
+}
+
+// writeFileAtomically replaces path only after the full temporary file is durable.
+func writeFileAtomically(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tempFile, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary file: %w", err)
+	}
+
+	tempPath := tempFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	if err := tempFile.Chmod(perm); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("set temporary file permissions: %w", err)
+	}
+	if _, err := tempFile.Write(data); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("write temporary file: %w", err)
+	}
+	if err := tempFile.Sync(); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("sync temporary file: %w", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("close temporary file: %w", err)
+	}
+
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("replace file: %w", err)
+	}
+	cleanup = false
 
 	return nil
 }

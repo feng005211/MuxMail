@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	texttemplate "text/template"
 	"time"
 
 	"github.com/muxmail/muxmail"
@@ -27,7 +29,7 @@ Usage:
   muxmail version
   muxmail serve -c config.yaml
   muxmail config validate -c config.yaml [--strict]
-  muxmail send dry-run -c config.yaml --app project_a --scene register_code --to user@example.com --locale en-US
+  muxmail send dry-run -c config.yaml --app project_a --scene register_code --to user@example.com [--locale en-US]
 `
 
 func main() {
@@ -72,6 +74,17 @@ func runServe(args []string, stdout io.Writer, stderr io.Writer) error {
 	}
 
 	secretResolver := config.NewSecretResolver()
+	report := config.Validate(cfg, secretResolver)
+	for _, warning := range report.Warnings {
+		fmt.Fprintf(stderr, "warning %s %s: %s\n", warning.Code, warning.Path, warning.Message)
+	}
+	if report.HasErrors() {
+		for _, validationError := range report.Errors {
+			fmt.Fprintf(stderr, "error %s %s: %s\n", validationError.Code, validationError.Path, validationError.Message)
+		}
+		return report.Err()
+	}
+
 	runtime, err := api.NewRuntime(cfg, secretResolver)
 	if err != nil {
 		return err
@@ -109,8 +122,9 @@ func runServe(args []string, stdout io.Writer, stderr io.Writer) error {
 		workerDone <- workerRuntime.Run(ctx)
 	}()
 
-	fmt.Fprintf(stdout, "muxmail %s listening on %s\n", muxmail.Version(), cfg.Server.Listen)
-	if err := runtime.Serve(ctx); err != nil {
+	if err := runtime.Serve(ctx, func(address string) {
+		fmt.Fprintf(stdout, "muxmail %s listening on %s\n", muxmail.Version(), address)
+	}); err != nil {
 		cancel()
 		_ = runtime.Close()
 		<-workerDone
@@ -252,12 +266,15 @@ func runSendDryRun(args []string, stdout io.Writer, stderr io.Writer) error {
 		return err
 	}
 
-	body, err := json.Marshal(map[string]any{
-		"scene":  options.sceneCode,
-		"to":     options.to,
-		"locale": options.locale,
-		"vars":   options.vars,
-	})
+	bodyFields := map[string]any{
+		"scene": options.sceneCode,
+		"to":    options.to,
+		"vars":  options.vars,
+	}
+	if options.locale != "" {
+		bodyFields["locale"] = options.locale
+	}
+	body, err := json.Marshal(bodyFields)
 	if err != nil {
 		return fmt.Errorf("muxmail: build dry-run request: %w", err)
 	}
@@ -291,13 +308,55 @@ func runSendDryRun(args []string, stdout io.Writer, stderr io.Writer) error {
 		Template:         rendered.TemplateCode,
 		ToDomain:         selection.RecipientDomain,
 		SelectedChannels: selection.Channels,
-		SubjectPreview:   rendered.Subject,
+		SubjectPreview:   redactedSubjectPreview(app, rendered, request.Vars),
 		HTMLRendered:     rendered.HasHTML,
 		TextRendered:     rendered.HasText,
 	}
 	encoder := json.NewEncoder(stdout)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(output)
+}
+
+func redactedSubjectPreview(app domain.App, rendered mailtemplate.RenderedMail, vars map[string]any) string {
+	subjectTemplate := ""
+	for _, tmpl := range app.Templates {
+		if tmpl.Code == rendered.TemplateCode && tmpl.Locale == rendered.Locale {
+			subjectTemplate = tmpl.Subject
+			break
+		}
+	}
+	if subjectTemplate == "" {
+		return ""
+	}
+
+	tmpl, err := texttemplate.New("dry_run_subject").Option("missingkey=error").Parse(subjectTemplate)
+	if err != nil {
+		return subjectTemplate
+	}
+	var output bytes.Buffer
+	if err := tmpl.Execute(&output, redactedVars(vars)); err != nil {
+		return subjectTemplate
+	}
+
+	return output.String()
+}
+
+func redactedVars(vars map[string]any) map[string]any {
+	redacted := make(map[string]any, len(vars))
+	for name, value := range vars {
+		switch value.(type) {
+		case string:
+			redacted[name] = "[redacted]"
+		case bool:
+			redacted[name] = false
+		case json.Number:
+			redacted[name] = json.Number("0")
+		default:
+			redacted[name] = "[redacted]"
+		}
+	}
+
+	return redacted
 }
 
 func parseDryRunOptions(args []string) (dryRunOptions, error) {
@@ -384,6 +443,9 @@ func nextOptionValue(args []string, index int, name string) (string, int, error)
 func dryRunApp(cfg *config.Config, appCode string) (domain.App, error) {
 	for _, appConfig := range cfg.Apps {
 		if appConfig.Code == appCode {
+			if !config.EnabledValue(appConfig.Enabled) {
+				return domain.App{}, fmt.Errorf("muxmail: app disabled: %s", appCode)
+			}
 			return config.DomainAppFromConfig(appConfig, nil), nil
 		}
 	}

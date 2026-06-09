@@ -1,0 +1,128 @@
+html,
+body,
+#root {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #f4f6f8;
+  color: #1f2933;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.app-sider {
+  min-height: 100vh;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 56px;
+  padding: 0 18px;
+  color: #f8fafc;
+  font-weight: 700;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.brand .anticon {
+  color: #4fc3f7;
+  font-size: 20px;
+}
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  height: 56px;
+  padding: 0 20px;
+  background: #ffffff;
+  border-bottom: 1px solid #d9e1e8;
+}
+
+.app-content {
+  padding: 20px;
+}
+
+.full-width {
+  width: 100%;
+}
+
+.connect-panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 120px);
+}
+
+.connect-card {
+  width: min(420px, 100%);
+}
+
+.filter-select {
+  width: 148px;
+}
+
+.email-filter {
+  width: 260px;
+}
+
+.small-number {
+  width: 96px;
+}
+
+.link-button {
+  max-width: 260px;
+  height: auto;
+  padding: 0;
+  white-space: normal;
+  text-align: left;
+}
+
+.metric-chart {
+  height: 260px;
+  min-width: 0;
+}
+
+.view-error {
+  margin-bottom: 16px;
+}
+
+.ant-card {
+  border-radius: 6px;
+}
+
+.ant-card-head-title {
+  font-size: 15px;
+}
+
+.ant-table-cell {
+  vertical-align: top;
+}
+
+@media (max-width: 768px) {
+  .app-content {
+    padding: 12px;
+  }
+
+  .app-header {
+    height: auto;
+    min-height: 56px;
+    padding: 8px 12px;
+  }
+
+  .filter-select,
+  .email-filter,
+  .small-number {
+    width: 100%;
+  }
+}

@@ -11,6 +11,7 @@ The MVP is intentionally lightweight: one process, one container, file-based con
 - App-scoped API keys, scenes, templates, route policies, and provider channels.
 - `POST /v1/mail/send` asynchronous send API.
 - App-scoped message, attempt, suppression, provider event, and stats summary read APIs.
+- Optional built-in Lite Admin UI at `/admin/` for dashboards, message inspection, provider events, suppressions, test sends, and safe config summaries.
 - Optional normalized, Resend, and Brevo provider event receivers.
 - Provider failover through Mock API, Resend API/SMTP, and Brevo API/SMTP.
 - Fixed-window rate limits and idempotency in memory.
@@ -23,7 +24,7 @@ Supported providers, daily/monthly quota notes, and public pricing references ar
 
 - No Tenant model.
 - No PostgreSQL or Redis requirement.
-- No admin UI requirement.
+- No requirement to use Lite Admin, and no online config editing in Lite Admin.
 - No inbound SMTP server.
 - No provider webhook receiver enabled by default.
 - No marketing bulk sending, attachments, open tracking, or click tracking.
@@ -34,7 +35,7 @@ Supported providers, daily/monthly quota notes, and public pricing references ar
 $env:GOCACHE = (Join-Path (Get-Location) '.gocache')
 go test ./...
 go vet ./...
-go build -o ./bin/muxmail ./cmd/muxmail
+make build
 ```
 
 On systems with a writable default Go cache, the same commands work without setting `GOCACHE`.
@@ -44,6 +45,8 @@ With `make` available:
 ```sh
 make verify
 ```
+
+`make verify` also runs `npm ci` inside `web/admin`, builds the Lite Admin UI, temporarily stages it for Go embedding, builds the binary, and restores the lightweight placeholder assets in the source tree.
 
 ## Validate And Dry-Run
 
@@ -86,6 +89,16 @@ make dry-run-example
 ```powershell
 go run ./cmd/muxmail serve -c config.yaml
 ```
+
+For source-tree runs, build `web/admin/dist` first with `make admin-build` or `cd web/admin && npm run build`; Docker image builds do this automatically.
+
+Open the built-in Lite Admin UI:
+
+```text
+http://localhost:8080/admin/
+```
+
+The admin UI uses an App API key in the current browser session to call the same App-scoped APIs. It keeps the key in page memory only, does not persist it in browser storage, does not expose provider secrets or edit YAML configuration, and receives `/v1/` API responses with `Cache-Control: no-store`. The `/admin/` HTML shell is also served with `no-store` so browser caches do not keep an old Admin bundle after upgrades.
 
 ## API
 
@@ -215,7 +228,9 @@ Authorization: Bearer <webhook_shared_secret>
 Content-Type: application/json
 ```
 
-This endpoint is disabled by default. It accepts MuxMail normalized provider events and can advance messages from `sent` to `delivered`, `bounced`, or `complained`.
+This endpoint is disabled by default. Enable it with `webhooks.enabled: true` and `webhooks.shared_secret_ref`. It accepts MuxMail normalized provider events and can advance messages from `sent` to `delivered`, `bounced`, or `complained`.
+Webhook events must include complete provider account, channel, and provider message metadata, and they are accepted only when that identity matches a recorded sent attempt for the same App and message. If a sent attempt has an empty `provider_message_id` because an accepted provider response omitted it, the authenticated webhook must still provide `provider_message_id` and match the recorded provider account and channel.
+For Lite JSONL logs, MuxMail stores a redacted source summary instead of the normalized request's raw `event_payload`.
 
 Resend native webhook receiver:
 
@@ -227,7 +242,7 @@ svix-timestamp: <unix-seconds>
 svix-signature: <signature>
 ```
 
-Enable it with `webhooks.resend_secret_ref`. MuxMail verifies the Svix signature and maps `email.delivered`, `email.bounced`, and `email.complained` events.
+Enable it with `webhooks.enabled: true` and `webhooks.resend_secret_ref`. MuxMail verifies the Svix signature and maps `email.delivered`, `email.bounced`, and `email.complained` events.
 
 Brevo native webhook receiver:
 
@@ -237,10 +252,11 @@ Authorization: Bearer <brevo_webhook_token>
 Content-Type: application/json
 ```
 
-Enable it with `webhooks.brevo_token_ref`. MuxMail maps Brevo `delivered`, `hardBounce`, and `spam` events, and reads MuxMail metadata back from Brevo tags.
+Enable it with `webhooks.enabled: true` and `webhooks.brevo_token_ref`. MuxMail maps Brevo `delivered`, `hardBounce`, and `spam` events, reads MuxMail metadata back from Brevo tags, and uses Brevo `ts_event` as the UTC event time.
 
-Bounce and complaint events automatically upsert `suppression.yaml` when the webhook payload includes the recipient email. The recipient email is used only for the suppression update and is not written to JSONL logs.
-Duplicate provider events with the same message/app/provider/provider message/event type/occurred-at identity are ignored.
+Bounce and complaint events must include a valid single recipient email address and automatically upsert `suppression.yaml`. The recipient email is used only for the suppression update and is not written to JSONL logs.
+Duplicate provider events with the same app/message/provider/provider account/provider channel/provider message/event type/occurred-at identity do not append another event record; they can still replay idempotent suppression and monotonic status repair.
+Late delivered events do not roll a bounced or complained message back to delivered; the event is still logged.
 
 Health endpoints:
 

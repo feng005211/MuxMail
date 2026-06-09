@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/muxmail/muxmail/internal/domain"
 	"github.com/muxmail/muxmail/internal/lite"
@@ -171,25 +173,36 @@ func (w *Worker) ProcessTask(ctx context.Context, task lite.QueueTask) error {
 	}
 
 	runtime, resolved := w.resolver.Resolve(channelCode)
-	attempt := attemptBase(task.Message, task.AttemptNo, channelCode, runtime)
+	attempt, logAttempt := attemptBase(task.Message, task.AttemptNo, channelCode, runtime, resolved)
+	logProviderStats := logAttempt && hasCompleteAttemptMetadata(attempt)
 	w.appendMessage(messageWithStatus(task.Message, domain.MessageStatusSending, "", ""))
-	w.appendAttempt(attemptWithStatus(attempt, domain.AttemptStatusSending, domain.FailureClassNone, "", "", "", 0))
+	if logProviderStats {
+		w.appendAttempt(attemptWithStatus(attempt, domain.AttemptStatusSending, domain.FailureClassNone, "", "", "", 0))
+	}
 
 	startedAt := w.now()
-	result := w.sendThroughProvider(ctx, task, runtime, resolved)
+	result := w.sendThroughProvider(ctx, task, channelCode, runtime, resolved)
 	durationMS := roundedDurationMS(w.now().Sub(startedAt))
 
 	if result.IsAccepted() {
-		w.appendAttempt(attemptWithStatus(attempt, domain.AttemptStatusSent, domain.FailureClassNone, "", "", result.Accepted.ProviderMessageID, durationMS))
+		if logProviderStats {
+			w.appendAttempt(attemptWithStatus(attempt, domain.AttemptStatusSent, domain.FailureClassNone, "", "", result.Accepted.ProviderMessageID, durationMS))
+		}
 		w.appendMessage(messageWithStatus(task.Message, domain.MessageStatusSent, "", ""))
-		w.recordAttemptStats(task.Message, runtime.Channel, lite.MetricAttemptsSent, durationMS)
+		if logProviderStats {
+			w.recordAttemptStats(task.Message, channelCode, runtime.Channel, lite.MetricAttemptsSent, durationMS)
+		}
 		w.recordMessageStat(task.Message, lite.MetricMessagesSent)
 		return nil
 	}
 
 	failed := normalizedFailure(result)
-	w.appendAttempt(attemptWithStatus(attempt, domain.AttemptStatusFailed, failed.FailureClass, failed.ErrorCode, failed.ErrorMessage, "", durationMS))
-	w.recordAttemptStats(task.Message, runtime.Channel, lite.MetricAttemptsFailed, durationMS)
+	if logAttempt {
+		w.appendAttempt(attemptWithStatus(attempt, domain.AttemptStatusFailed, failed.FailureClass, failed.ErrorCode, failed.ErrorMessage, "", durationMS))
+		if logProviderStats {
+			w.recordAttemptStats(task.Message, channelCode, runtime.Channel, lite.MetricAttemptsFailed, durationMS)
+		}
+	}
 
 	if failed.FailureClass == domain.FailureClassMessagePermanent {
 		w.appendMessage(messageWithStatus(task.Message, domain.MessageStatusFailed, failed.ErrorCode, failed.ErrorMessage))
@@ -209,7 +222,9 @@ func (w *Worker) ProcessTask(ctx context.Context, task lite.QueueTask) error {
 	retryTask := task
 	retryTask.AttemptNo = nextAttempt
 	if err := w.queue.EnqueueDelayed(retryTask, delay); err != nil {
-		return err
+		w.appendMessage(messageWithStatus(task.Message, domain.MessageStatusFailed, retryScheduleFailureCode(err), "retry enqueue failed"))
+		w.recordMessageStat(task.Message, lite.MetricMessagesFailed)
+		return fmt.Errorf("enqueue retry attempt %d for message %s: %w", nextAttempt, task.Message.MessageID, err)
 	}
 
 	return nil
@@ -231,8 +246,12 @@ func (w *Worker) runOne(ctx context.Context) {
 	}
 }
 
-func (w *Worker) sendThroughProvider(ctx context.Context, task lite.QueueTask, runtime ProviderChannelRuntime, resolved bool) provideradapter.SendResult {
-	if !resolved || runtime.Provider == nil || !runtime.Channel.Enabled || !runtime.Account.Enabled {
+func (w *Worker) sendThroughProvider(ctx context.Context, task lite.QueueTask, channelCode string, runtime ProviderChannelRuntime, resolved bool) provideradapter.SendResult {
+	if !resolved ||
+		runtime.Provider == nil ||
+		!hasRuntimeAttemptMetadata(channelCode, runtime, resolved) ||
+		!runtime.Channel.Enabled ||
+		!runtime.Account.Enabled {
 		return provideradapter.ChannelFailure(domain.ErrorCodeProviderUnavailable, "provider channel unavailable")
 	}
 
@@ -300,11 +319,11 @@ func (w *Worker) recordMessageStat(message domain.Message, metric string) {
 	})
 }
 
-func (w *Worker) recordAttemptStats(message domain.Message, channel domain.ProviderChannel, metric string, durationMS int) {
+func (w *Worker) recordAttemptStats(message domain.Message, channelCode string, channel domain.ProviderChannel, metric string, durationMS int) {
 	_ = w.stats.Record(lite.StatsRecord{
 		AppCode:             message.AppCode,
 		SceneCode:           message.SceneCode,
-		ProviderChannelCode: channel.Code,
+		ProviderChannelCode: channelCode,
 		Transport:           channel.Transport,
 		Metric:              metric,
 		Value:               1,
@@ -312,7 +331,7 @@ func (w *Worker) recordAttemptStats(message domain.Message, channel domain.Provi
 	_ = w.stats.Record(lite.StatsRecord{
 		AppCode:             message.AppCode,
 		SceneCode:           message.SceneCode,
-		ProviderChannelCode: channel.Code,
+		ProviderChannelCode: channelCode,
 		Transport:           channel.Transport,
 		Metric:              lite.MetricProviderDurationMS,
 		Value:               float64(durationMS),
@@ -333,15 +352,42 @@ func hasProviderChannelForAttempt(message domain.Message, attemptNo int, maxAtte
 	return ok
 }
 
-func attemptBase(message domain.Message, attemptNo int, channelCode string, runtime ProviderChannelRuntime) domain.Attempt {
+func attemptBase(message domain.Message, attemptNo int, channelCode string, runtime ProviderChannelRuntime, resolved bool) (domain.Attempt, bool) {
+	if channelCode == "" {
+		return domain.Attempt{}, false
+	}
+	accountCode := runtime.Account.Code
+	provider := runtime.Account.Provider
+	transport := runtime.Channel.Transport
+	if !hasRuntimeAttemptMetadata(channelCode, runtime, resolved) {
+		accountCode = ""
+		provider = ""
+		transport = ""
+	}
+
 	return domain.Attempt{
 		MessageID:           message.MessageID,
+		AppCode:             message.AppCode,
 		AttemptNo:           attemptNo,
-		Provider:            runtime.Account.Provider,
-		ProviderAccountCode: runtime.Account.Code,
+		Provider:            provider,
+		ProviderAccountCode: accountCode,
 		ProviderChannelCode: channelCode,
-		Transport:           runtime.Channel.Transport,
-	}
+		Transport:           transport,
+	}, true
+}
+
+func hasCompleteAttemptMetadata(attempt domain.Attempt) bool {
+	return attempt.Provider.IsValid() && attempt.ProviderAccountCode != "" && attempt.Transport.IsValid()
+}
+
+func hasRuntimeAttemptMetadata(channelCode string, runtime ProviderChannelRuntime, resolved bool) bool {
+	return resolved &&
+		channelCode != "" &&
+		runtime.Account.Code != "" &&
+		runtime.Channel.Code == channelCode &&
+		runtime.Channel.Account == runtime.Account.Code &&
+		runtime.Account.Provider.IsValid() &&
+		runtime.Channel.Transport.IsValid()
 }
 
 func attemptWithStatus(attempt domain.Attempt, status domain.AttemptStatus, failureClass domain.FailureClass, errorCode domain.ErrorCode, errorMessage string, providerMessageID string, durationMS int) domain.Attempt {
@@ -385,6 +431,15 @@ func normalizedFailure(result provideradapter.SendResult) provideradapter.Failed
 	}
 }
 
+func retryScheduleFailureCode(err error) domain.ErrorCode {
+	var queueFull lite.QueueFullError
+	if errors.As(err, &queueFull) {
+		return domain.ErrorCodeQueueFull
+	}
+
+	return domain.ErrorCodeInternal
+}
+
 func roundedDurationMS(duration time.Duration) int {
 	if duration <= 0 {
 		return 0
@@ -395,9 +450,15 @@ func roundedDurationMS(duration time.Duration) int {
 
 func safeErrorMessage(message string) string {
 	const maxBytes = 256
+	message = strings.ToValidUTF8(message, "")
 	if len(message) <= maxBytes {
 		return message
 	}
 
-	return message[:maxBytes]
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(message[end]) {
+		end--
+	}
+
+	return message[:end]
 }

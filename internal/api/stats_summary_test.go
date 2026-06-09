@@ -103,6 +103,22 @@ func TestStatsSummaryRejectsInvalidWindow(t *testing.T) {
 	assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidQuery)
 }
 
+func TestStatsSummaryTrimsWindowQuery(t *testing.T) {
+	runtime := openTestRuntime(t, "off")
+	defer runtime.Close()
+
+	recorder := performStatsSummary(t, runtime, " 1h ", testAPIKey)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var response statsSummaryResponse
+	decodeJSON(t, recorder.Body.String(), &response)
+	if response.Window != "1h" {
+		t.Fatalf("expected trimmed 1h window, got %+v", response)
+	}
+}
+
 func TestStatsSummaryRequiresAuthorization(t *testing.T) {
 	runtime := openTestRuntime(t, "off")
 	defer runtime.Close()

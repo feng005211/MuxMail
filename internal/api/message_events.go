@@ -26,7 +26,7 @@ type messageEventResponseEntry struct {
 	ProviderChannel   string                   `json:"provider_channel"`
 	ProviderMessageID string                   `json:"provider_message_id"`
 	EventType         domain.ProviderEventType `json:"event_type"`
-	OccurredAt        string                   `json:"occurred_at,omitempty"`
+	OccurredAt        string                   `json:"occurred_at"`
 }
 
 func (r *Runtime) handleMessageRoutes(w http.ResponseWriter, httpRequest *http.Request) {

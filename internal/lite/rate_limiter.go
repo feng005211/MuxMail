@@ -39,6 +39,7 @@ type RateLimitDecision struct {
 	Limit             int
 	CurrentCount      int
 	RetryAfterSeconds int
+	consumed          []rateLimitCounterKey
 }
 
 // RateLimitExceededError is returned when a request exceeds any limit rule.
@@ -109,15 +110,40 @@ func (l *FixedWindowRateLimiter) Allow(request RateLimitRequest) (RateLimitDecis
 		}
 	}
 
+	consumed := make([]rateLimitCounterKey, 0, len(checks))
 	for _, check := range checks {
 		key := check.key(request)
 		counter := l.counters[key]
 		counter.Count++
 		counter.ExpiresAt = check.expiresAt
 		l.counters[key] = counter
+		consumed = append(consumed, key)
 	}
 
-	return RateLimitDecision{Allowed: true}, nil
+	return RateLimitDecision{Allowed: true, consumed: consumed}, nil
+}
+
+// Rollback releases quota consumed by an allowed decision when request acceptance fails.
+func (l *FixedWindowRateLimiter) Rollback(decision RateLimitDecision) {
+	if !decision.Allowed || len(decision.consumed) == 0 {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for _, key := range decision.consumed {
+		counter, exists := l.counters[key]
+		if !exists {
+			continue
+		}
+		if counter.Count <= 1 {
+			delete(l.counters, key)
+			continue
+		}
+		counter.Count--
+		l.counters[key] = counter
+	}
 }
 
 type rateLimitCounterKey struct {

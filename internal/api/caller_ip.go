@@ -78,8 +78,11 @@ func parseTrustedProxy(value string) (netip.Prefix, error) {
 		if err != nil {
 			return netip.Prefix{}, fmt.Errorf("parse trusted proxy prefix %q: %w", value, err)
 		}
-		addr := normalizeAddr(prefix.Addr())
-		return netip.PrefixFrom(addr, prefix.Bits()).Masked(), nil
+		normalized, ok := normalizeTrustedProxyPrefix(prefix)
+		if !ok {
+			return netip.Prefix{}, fmt.Errorf("parse trusted proxy prefix %q: IPv4-mapped prefix is too broad", value)
+		}
+		return normalized, nil
 	}
 
 	addr, err := netip.ParseAddr(value)
@@ -91,14 +94,37 @@ func parseTrustedProxy(value string) (netip.Prefix, error) {
 	return netip.PrefixFrom(addr, addr.BitLen()), nil
 }
 
-func firstHeaderIP(value string) (netip.Addr, bool) {
-	for _, part := range strings.Split(value, ",") {
-		if addr, ok := parseIPFromAddress(part); ok {
-			return addr, true
+func normalizeTrustedProxyPrefix(prefix netip.Prefix) (netip.Prefix, bool) {
+	addr := prefix.Addr()
+	bits := prefix.Bits()
+	if addr.Is4In6() {
+		if bits <= 96 {
+			return netip.Prefix{}, false
 		}
+		addr = addr.Unmap()
+		bits -= 96
+	} else {
+		addr = normalizeAddr(addr)
+	}
+	if bits == 0 {
+		return netip.Prefix{}, false
 	}
 
-	return netip.Addr{}, false
+	normalized := netip.PrefixFrom(addr, bits)
+	if !normalized.IsValid() {
+		return netip.Prefix{}, false
+	}
+
+	return normalized.Masked(), true
+}
+
+func firstHeaderIP(value string) (netip.Addr, bool) {
+	if strings.TrimSpace(value) == "" {
+		return netip.Addr{}, false
+	}
+
+	first, _, _ := strings.Cut(value, ",")
+	return parseIPFromAddress(first)
 }
 
 func parseIPFromAddress(value string) (netip.Addr, bool) {

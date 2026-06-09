@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -43,6 +44,14 @@ func (r *Runtime) handleSend(w http.ResponseWriter, httpRequest *http.Request) {
 }
 
 func (r *Runtime) processSend(httpRequest *http.Request, requestID string) (sendResponse, error) {
+	auth, err := r.auth.AuthenticateHeader(httpRequest.Header.Get("Authorization"))
+	if err != nil {
+		return sendResponse{}, err
+	}
+	if err := validateSendContentType(httpRequest.Header.Get("Content-Type")); err != nil {
+		return sendResponse{}, err
+	}
+
 	maxBodyBytes := int64(r.defaults.MaxRequestBodyBytes)
 	body, err := io.ReadAll(io.LimitReader(httpRequest.Body, maxBodyBytes+1))
 	if err != nil {
@@ -51,15 +60,12 @@ func (r *Runtime) processSend(httpRequest *http.Request, requestID string) (send
 	if int64(len(body)) > maxBodyBytes {
 		return sendResponse{}, domain.RequestValidationError{Code: domain.ErrorCodeRequestTooLarge, Message: "request body is too large"}
 	}
-	if err := validateSendContentType(httpRequest.Header.Get("Content-Type")); err != nil {
-		return sendResponse{}, err
-	}
-	sceneCode, err := extractSceneCode(body)
+	raw, err := decodeSendJSONObject(body)
 	if err != nil {
 		return sendResponse{}, err
 	}
 
-	auth, err := r.auth.AuthenticateHeader(httpRequest.Header.Get("Authorization"))
+	sceneCode, err := extractSceneCode(raw)
 	if err != nil {
 		return sendResponse{}, err
 	}
@@ -94,7 +100,7 @@ func (r *Runtime) processSend(httpRequest *http.Request, requestID string) (send
 	}
 	idempotencyHash := domain.IdempotencyHash(auth.App.Code, scene.Code, request.IdempotencyKey)
 
-	idempotencyDecision, err := r.idempotent.Check(auth.App.Code, scene.Code, idempotencyHash, fingerprint)
+	idempotencyReservation, idempotencyDecision, err := r.idempotent.Reserve(auth.App.Code, scene.Code, idempotencyHash, fingerprint)
 	if err != nil {
 		return sendResponse{}, err
 	}
@@ -107,6 +113,12 @@ func (r *Runtime) processSend(httpRequest *http.Request, requestID string) (send
 		})
 		return sendResponse{RequestID: requestID, MessageID: idempotencyDecision.MessageID, Status: domain.MessageStatusQueued}, nil
 	}
+	idempotencyCompleted := false
+	defer func() {
+		if !idempotencyCompleted {
+			idempotencyReservation.Release()
+		}
+	}()
 
 	if entry, ok := r.suppressed.Contains(auth.App.Code, request.NormalizedToEmail); ok {
 		return sendResponse{}, domain.RequestValidationError{
@@ -121,14 +133,35 @@ func (r *Runtime) processSend(httpRequest *http.Request, requestID string) (send
 	}
 
 	callerIP := r.callerIP.resolve(httpRequest.RemoteAddr, httpRequest.Header)
-	_, err = r.rateLimit.Allow(lite.RateLimitRequest{
+	queueReservation, err := r.queue.Reserve()
+	if err != nil {
+		var queueFull lite.QueueFullError
+		if errors.As(err, &queueFull) {
+			_ = r.stats.Record(lite.StatsRecord{
+				AppCode:   auth.App.Code,
+				SceneCode: scene.Code,
+				Metric:    lite.MetricRequestsQueueFull,
+				Value:     1,
+			})
+		}
+		return sendResponse{}, err
+	}
+	queueCommitted := false
+	defer func() {
+		if !queueCommitted {
+			queueReservation.Release()
+		}
+	}()
+
+	rateLimitRequest := lite.RateLimitRequest{
 		AppCode:           auth.App.Code,
 		SceneCode:         scene.Code,
 		NormalizedToEmail: request.NormalizedToEmail,
 		UserIP:            request.UserIP,
 		CallerIP:          callerIP,
 		Policy:            scene.RateLimit,
-	})
+	}
+	rateLimitDecision, err := r.rateLimit.Allow(rateLimitRequest)
 	if err != nil {
 		_ = r.stats.Record(lite.StatsRecord{
 			AppCode:   auth.App.Code,
@@ -138,6 +171,12 @@ func (r *Runtime) processSend(httpRequest *http.Request, requestID string) (send
 		})
 		return sendResponse{}, err
 	}
+	rateLimitCommitted := false
+	defer func() {
+		if !rateLimitCommitted {
+			r.rateLimit.Rollback(rateLimitDecision)
+		}
+	}()
 
 	messageID, err := domain.NewMessageID()
 	if err != nil {
@@ -169,18 +208,15 @@ func (r *Runtime) processSend(httpRequest *http.Request, requestID string) (send
 	if err := r.messageLog.AppendMessage(message); err != nil {
 		return sendResponse{}, fmt.Errorf("append queued message: %w", err)
 	}
-	if err := r.queue.Enqueue(lite.QueueTask{Message: message, AttemptNo: 1}); err != nil {
-		_ = r.stats.Record(lite.StatsRecord{
-			AppCode:   auth.App.Code,
-			SceneCode: scene.Code,
-			Metric:    lite.MetricRequestsQueueFull,
-			Value:     1,
-		})
+	if err := commitInitialQueueTask(r.messageLog, queueReservation, message); err != nil {
 		return sendResponse{}, err
 	}
-	if err := r.idempotent.MarkQueued(auth.App.Code, scene.Code, idempotencyHash, fingerprint, messageID); err != nil {
+	queueCommitted = true
+	rateLimitCommitted = true
+	if err := idempotencyReservation.CompleteQueued(messageID); err != nil {
 		return sendResponse{}, err
 	}
+	idempotencyCompleted = true
 
 	_ = r.stats.Record(lite.StatsRecord{
 		AppCode:   auth.App.Code,
@@ -190,6 +226,21 @@ func (r *Runtime) processSend(httpRequest *http.Request, requestID string) (send
 	})
 
 	return sendResponse{RequestID: requestID, MessageID: messageID, Status: domain.MessageStatusQueued}, nil
+}
+
+func commitInitialQueueTask(messageLog *lite.MessageLog, reservation *lite.QueueReservation, message domain.Message) error {
+	if err := reservation.Commit(lite.QueueTask{Message: message, AttemptNo: 1}); err != nil {
+		failed := message
+		failed.Status = domain.MessageStatusFailed
+		failed.ErrorCode = domain.ErrorCodeInternal
+		failed.ErrorMessage = "queue commit failed"
+		if appendErr := messageLog.AppendMessage(failed); appendErr != nil {
+			return fmt.Errorf("commit queued message: %w; append failed message: %v", err, appendErr)
+		}
+		return err
+	}
+
+	return nil
 }
 
 func findSceneByCode(app domain.App, code string) (domain.Scene, error) {
@@ -212,29 +263,33 @@ func validateSendContentType(contentType string) error {
 		return domain.RequestValidationError{Code: domain.ErrorCodeUnsupportedMediaType, Message: "content type must be application/json"}
 	}
 	mediaType, _, err := mime.ParseMediaType(contentType)
-	if err != nil || mediaType != "application/json" {
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
 		return domain.RequestValidationError{Code: domain.ErrorCodeUnsupportedMediaType, Message: "content type must be application/json"}
 	}
 
 	return nil
 }
 
-func extractSceneCode(body []byte) (string, error) {
+func decodeSendJSONObject(body []byte) (map[string]json.RawMessage, error) {
 	var raw map[string]json.RawMessage
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := decoder.Decode(&raw); err != nil {
-		return "", domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "request body must be a JSON object"}
+		return nil, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "request body must be a JSON object"}
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err == nil {
-		return "", domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "request body must contain a single JSON object"}
+		return nil, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "request body must contain a single JSON object"}
 	} else if err != io.EOF {
-		return "", domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "request body must contain a single JSON object"}
+		return nil, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "request body must contain a single JSON object"}
 	}
 	if raw == nil {
-		return "", domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "request body must be a JSON object"}
+		return nil, domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "request body must be a JSON object"}
 	}
 
+	return raw, nil
+}
+
+func extractSceneCode(raw map[string]json.RawMessage) (string, error) {
 	value, exists := raw["scene"]
 	if !exists {
 		return "", domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "scene is required"}
@@ -245,6 +300,9 @@ func extractSceneCode(body []byte) (string, error) {
 	}
 	if scene == "" {
 		return "", domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "scene is required"}
+	}
+	if !isValidIdentifierFilter(scene) {
+		return "", domain.RequestValidationError{Code: domain.ErrorCodeInvalidJSON, Message: "scene is invalid"}
 	}
 
 	return scene, nil

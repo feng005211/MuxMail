@@ -10,11 +10,14 @@ muxmail serve -c /etc/muxmail/config.yaml
 
 MuxMail 进程内不处理 TLS。公网 HTTPS 必须由 1Panel、OpenResty、Nginx、Caddy 或其他反向代理终止后，再把 HTTP 请求转发到 MuxMail 的 `8080` 端口。
 
+可选 Lite Admin 管理界面内置在同一个 MuxMail 进程里，路径固定为 `/admin/`。需要使用 Lite Admin 时，反向代理暴露 API 域名应同时保留 `/admin/`、`/v1/`、`/healthz`、`/readyz` 和 `/version`。Lite Admin 在当前浏览器会话中使用 App API Key 调用 App-scoped API，不需要单独的后台服务，也不把 App API Key 写入服务端配置或浏览器持久化存储。MuxMail 对 `/v1/` API 响应和 `/admin/` HTML 入口设置 `Cache-Control: no-store`，反向代理不要覆盖这个缓存策略。
+
 ## 1. 推荐部署拓扑
 
 ```mermaid
 flowchart LR
     Client["Business Clients"] --> Proxy["Reverse Proxy / 1Panel"]
+    Browser["Admin Browser"] --> Proxy
     Provider["Brevo / Resend Webhooks"] --> Proxy
     Proxy --> App["MuxMail :8080"]
     App --> Data["/var/lib/muxmail"]
@@ -35,7 +38,7 @@ flowchart LR
 2. 已在邮件服务商控制台完成验证的发信域名或子域名，例如 `auth.example.com`、`auth-bak.example.com`。
 3. 真实的业务 API Key、Brevo API Key、Resend API Key，以及可选的 Webhook Secret。
 4. 一个可持久化的数据目录，用于保存 JSONL 日志和 `suppression.yaml`。
-5. 一个生产配置文件，建议从 [config.container.example.yaml](D:/Coding/Go/MuxMail/config.container.example.yaml) 复制后修改。
+5. 一个生产配置文件，建议从 [config.container.example.yaml](../config.container.example.yaml) 复制后修改。
 
 生产环境不要在配置文件中使用 `plain:` 密钥引用。真实部署只使用：
 
@@ -66,7 +69,7 @@ muxmail/
 
 ## 4. 配置文件要点
 
-推荐从 [config.container.example.yaml](D:/Coding/Go/MuxMail/config.container.example.yaml) 开始。这个示例已经适配容器路径，并默认使用 `env:` 引用密钥。
+推荐从 [config.container.example.yaml](../config.container.example.yaml) 开始。这个示例已经适配容器路径，并默认使用 `env:` 引用密钥。
 
 部署时重点检查这些字段：
 
@@ -80,7 +83,7 @@ server:
     - 10.0.0.0/8
 ```
 
-`trusted_proxies` 必须改成你自己反向代理所在的实际 IP 或 CIDR。不要配置 `0.0.0.0/0`，否则外部客户端可以伪造 `X-Forwarded-For`。
+`trusted_proxies` 必须改成你自己反向代理所在的实际 IP 或 CIDR。不要配置 `0.0.0.0/0`、`::/0` 或 `::ffff:0.0.0.0/96`，否则外部客户端可以伪造 `X-Forwarded-For`；MuxMail 会在配置校验阶段拒绝这些全网信任前缀。
 
 如果反向代理和 MuxMail 在同一台机器，常见写法是：
 
@@ -160,7 +163,7 @@ webhooks:
 
 ### 5.1 准备本地配置
 
-推荐从 [config.example.yaml](D:/Coding/Go/MuxMail/config.example.yaml) 复制出一份本地配置，例如：
+推荐从 [config.example.yaml](../config.example.yaml) 复制出一份本地配置，例如：
 
 ```text
 config.local.yaml
@@ -257,11 +260,12 @@ go run ./cmd/muxmail serve -c config.local.yaml
 如果你已经先执行过构建，也可以直接运行二进制：
 
 ```powershell
-go build -o ./bin/muxmail ./cmd/muxmail
+make build
 .\bin\muxmail serve -c config.local.yaml
 ```
 
 服务启动后，MuxMail 会同时启动 HTTP API 和内存 Worker。
+源码目录本地运行时，真实 Lite Admin 静态资源来自 `web/admin/dist`；`make build` 会自动构建前端、临时同步到 Go 嵌入资源目录完成二进制构建，然后恢复源码树里的占位资源。Docker 镜像构建也会自动生成并嵌入这份前端产物。
 
 ### 5.6 最小本地联调
 
@@ -271,6 +275,14 @@ go build -o ./bin/muxmail ./cmd/muxmail
 curl.exe http://127.0.0.1:8080/healthz
 curl.exe http://127.0.0.1:8080/readyz
 ```
+
+本地管理界面地址：
+
+```text
+http://127.0.0.1:8080/admin/
+```
+
+输入当前 App 的 API Key 后，管理界面可以查看仪表盘、消息、尝试记录、Provider Event 列表、退信名单和安全配置摘要，也可以发起测试发送。API Key 只保存在当前页面内存中，刷新页面后需要重新输入。
 
 然后用本地配置里的业务 API Key 调一次发送接口：
 
@@ -296,7 +308,7 @@ curl.exe -X POST http://127.0.0.1:8080/v1/mail/send `
 make verify
 ```
 
-如果本机 `go` 默认缓存目录不可写，可以按 [README.md](D:/Coding/Go/MuxMail/README.md) 里的方式先设置：
+如果本机 `go` 默认缓存目录不可写，可以按 [README.md](../README.md) 里的方式先设置：
 
 ```powershell
 $env:GOCACHE = (Join-Path (Get-Location) '.gocache')
@@ -348,7 +360,7 @@ docker run -d \
 
 ### 6.2 Docker Compose
 
-仓库里已经提供了 [compose.example.yaml](D:/Coding/Go/MuxMail/compose.example.yaml)。生产环境建议复制成自己的 `compose.yaml`，再替换环境变量和值。
+仓库里已经提供了 [compose.example.yaml](../compose.example.yaml)。生产环境建议复制成自己的 `compose.yaml`，再替换环境变量和值。
 
 一个最小可用的 Compose 例子如下：
 
@@ -380,6 +392,12 @@ services:
 
 ```text
 docker compose -f compose.example.yaml up -d
+```
+
+需要使用 Lite Admin 时，它与 API 使用同一个端口：
+
+```text
+http://127.0.0.1:8080/admin/
 ```
 
 ## 7. 启动前检查

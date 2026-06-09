@@ -85,6 +85,44 @@ func TestMessageStatusMissingMessageReturnsNotFound(t *testing.T) {
 	assertErrorResponse(t, recorder, http.StatusNotFound, domain.ErrorCodeMessageNotFound)
 }
 
+func TestMessageStatusRejectsUnsafeMessageIDPathSegmentBeforeLogQuery(t *testing.T) {
+	runtime := openTestRuntime(t, "off")
+	defer runtime.Close()
+
+	messageLog := runtime.messageLog
+	runtime.messageLog = nil
+	defer func() {
+		runtime.messageLog = messageLog
+	}()
+
+	for _, messageID := range []string{
+		"bad_01ABC",
+		"msg_",
+		"msg_bad.segment",
+		"msg_" + strings.Repeat("a", maxMessageIDBytes),
+	} {
+		recorder := performMessageStatus(t, runtime, messageID, testAPIKey)
+		assertErrorResponse(t, recorder, http.StatusNotFound, domain.ErrorCodeMessageNotFound)
+	}
+}
+
+func TestMessageEventsAndAttemptsRejectUnsafeMessageIDPathSegment(t *testing.T) {
+	runtime := openTestRuntime(t, "off")
+	defer runtime.Close()
+
+	messageLog := runtime.messageLog
+	runtime.messageLog = nil
+	defer func() {
+		runtime.messageLog = messageLog
+	}()
+
+	recorder := performMessageEvents(t, runtime, "msg_bad.segment", testAPIKey)
+	assertErrorResponse(t, recorder, http.StatusNotFound, domain.ErrorCodeMessageNotFound)
+
+	recorder = performMessageAttempts(t, runtime, "msg_bad.segment", testAPIKey)
+	assertErrorResponse(t, recorder, http.StatusNotFound, domain.ErrorCodeMessageNotFound)
+}
+
 func TestMessageListReturnsLatestSnapshots(t *testing.T) {
 	runtime := openTestRuntime(t, "off")
 	defer runtime.Close()
@@ -162,6 +200,9 @@ func TestMessageListRejectsInvalidQuery(t *testing.T) {
 	assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidQuery)
 
 	recorder = performMessageList(t, runtime, "status=opening", testAPIKey)
+	assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidQuery)
+
+	recorder = performMessageList(t, runtime, "scene=RegisterCode", testAPIKey)
 	assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidQuery)
 }
 
@@ -248,6 +289,16 @@ func TestFailedMessageListSupportsSceneAndLimit(t *testing.T) {
 	}
 	if response.Messages[0].Scene != "register_code" || response.Messages[0].Status != domain.MessageStatusFailed {
 		t.Fatalf("unexpected failed message entry: %+v", response.Messages[0])
+	}
+}
+
+func TestFailedMessageListRejectsStatusFilter(t *testing.T) {
+	runtime := openTestRuntime(t, "off")
+	defer runtime.Close()
+
+	for _, status := range []string{"failed", "sent"} {
+		recorder := performFailedMessageList(t, runtime, "status="+status, testAPIKey)
+		assertErrorResponse(t, recorder, http.StatusUnprocessableEntity, domain.ErrorCodeInvalidQuery)
 	}
 }
 
@@ -466,6 +517,7 @@ func TestMessageAttemptsReturnsTimeline(t *testing.T) {
 	}
 	if err := runtime.MessageLog().AppendAttempt(domain.Attempt{
 		MessageID:           "msg_attempts",
+		AppCode:             "project_a",
 		AttemptNo:           1,
 		Provider:            domain.ProviderResend,
 		ProviderAccountCode: "resend_main",
@@ -478,6 +530,7 @@ func TestMessageAttemptsReturnsTimeline(t *testing.T) {
 	}
 	if err := runtime.MessageLog().AppendAttempt(domain.Attempt{
 		MessageID:           "msg_attempts",
+		AppCode:             "project_a",
 		AttemptNo:           1,
 		Provider:            domain.ProviderResend,
 		ProviderAccountCode: "resend_main",
@@ -509,6 +562,46 @@ func TestMessageAttemptsReturnsTimeline(t *testing.T) {
 	}
 	if response.Attempts[1].ProviderMessageID != "provider_123" || response.Attempts[1].DurationMS != 42 {
 		t.Fatalf("unexpected attempt metadata: %+v", response.Attempts[1])
+	}
+}
+
+func TestMessageAttemptsReturnsErrorMessage(t *testing.T) {
+	runtime := openTestRuntime(t, "off")
+	defer runtime.Close()
+
+	message := testStatusMessage("msg_attempt_error")
+	if err := runtime.MessageLog().AppendMessage(message); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+	if err := runtime.MessageLog().AppendAttempt(domain.Attempt{
+		MessageID:           "msg_attempt_error",
+		AppCode:             "project_a",
+		AttemptNo:           1,
+		Provider:            domain.ProviderResend,
+		ProviderAccountCode: "resend_main",
+		ProviderChannelCode: "resend_auth_api",
+		Transport:           domain.TransportAPI,
+		Status:              domain.AttemptStatusFailed,
+		FailureClass:        domain.FailureClassTemporary,
+		ErrorCode:           domain.ErrorCodeProviderUnavailable,
+		ErrorMessage:        "provider request failed",
+		DurationMS:          42,
+	}); err != nil {
+		t.Fatalf("append failed attempt: %v", err)
+	}
+
+	recorder := performMessageAttempts(t, runtime, "msg_attempt_error", testAPIKey)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var response messageAttemptsResponse
+	decodeJSON(t, recorder.Body.String(), &response)
+	if len(response.Attempts) != 1 {
+		t.Fatalf("expected one attempt record, got %+v", response.Attempts)
+	}
+	if response.Attempts[0].ErrorMessage != "provider request failed" {
+		t.Fatalf("expected attempt error message, got %+v", response.Attempts[0])
 	}
 }
 
@@ -549,6 +642,7 @@ func TestMessageAttemptsHidesOtherApps(t *testing.T) {
 	}
 	if err := runtime.MessageLog().AppendAttempt(domain.Attempt{
 		MessageID:           "msg_cross_app_attempts",
+		AppCode:             "project_b",
 		AttemptNo:           1,
 		Provider:            domain.ProviderResend,
 		ProviderAccountCode: "resend_main",
@@ -564,6 +658,67 @@ func TestMessageAttemptsHidesOtherApps(t *testing.T) {
 
 	recorder := performMessageAttempts(t, runtime, "msg_cross_app_attempts", testAPIKey)
 	assertErrorResponse(t, recorder, http.StatusNotFound, domain.ErrorCodeMessageNotFound)
+}
+
+func TestMessageAttemptsFiltersSameMessageIDByApp(t *testing.T) {
+	cfg := testRuntimeConfig(t, "off")
+	otherApp := cfg.Apps[0]
+	otherApp.Code = "project_b"
+	otherApp.APIKeys = []config.APIKeyConfig{{Name: "default", KeyRef: "plain:mk_test_other_api_key_123456789"}}
+	cfg.Apps = append(cfg.Apps, otherApp)
+	runtime := openRuntimeFromConfig(t, cfg)
+	defer runtime.Close()
+
+	projectA := testStatusMessage("msg_shared_attempts")
+	projectB := projectA
+	projectB.AppCode = "project_b"
+	if err := runtime.MessageLog().AppendMessage(projectA); err != nil {
+		t.Fatalf("append project_a message: %v", err)
+	}
+	if err := runtime.MessageLog().AppendMessage(projectB); err != nil {
+		t.Fatalf("append project_b message: %v", err)
+	}
+	if err := runtime.MessageLog().AppendAttempt(domain.Attempt{
+		MessageID:           "msg_shared_attempts",
+		AppCode:             "project_a",
+		AttemptNo:           1,
+		Provider:            domain.ProviderResend,
+		ProviderAccountCode: "resend_main",
+		ProviderChannelCode: "resend_auth_api",
+		Transport:           domain.TransportAPI,
+		Status:              domain.AttemptStatusSent,
+		FailureClass:        domain.FailureClassNone,
+		ProviderMessageID:   "provider_a",
+		DurationMS:          42,
+	}); err != nil {
+		t.Fatalf("append project_a attempt: %v", err)
+	}
+	if err := runtime.MessageLog().AppendAttempt(domain.Attempt{
+		MessageID:           "msg_shared_attempts",
+		AppCode:             "project_b",
+		AttemptNo:           1,
+		Provider:            domain.ProviderResend,
+		ProviderAccountCode: "resend_main",
+		ProviderChannelCode: "resend_auth_api",
+		Transport:           domain.TransportAPI,
+		Status:              domain.AttemptStatusSent,
+		FailureClass:        domain.FailureClassNone,
+		ProviderMessageID:   "provider_b",
+		DurationMS:          99,
+	}); err != nil {
+		t.Fatalf("append project_b attempt: %v", err)
+	}
+
+	recorder := performMessageAttempts(t, runtime, "msg_shared_attempts", testAPIKey)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var response messageAttemptsResponse
+	decodeJSON(t, recorder.Body.String(), &response)
+	if len(response.Attempts) != 1 || response.Attempts[0].ProviderMessageID != "provider_a" {
+		t.Fatalf("expected only project_a attempt, got %+v", response.Attempts)
+	}
 }
 
 func performMessageStatus(t *testing.T, runtime *Runtime, messageID string, apiKey string) *httptest.ResponseRecorder {

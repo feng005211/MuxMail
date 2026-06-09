@@ -335,7 +335,8 @@ Suppression 文件规则：
 文件路径相对于 config.yaml 所在目录解析。
 文件不存在时视为空名单。
 文件存在但解析失败时，muxmail serve 和 config validate 都失败。
-Webhook 自动写入时按 app 和 normalized_to_email 去重，已存在项不覆盖。
+每个条目必须包含非空 app、合法的单个 ASCII addr-spec email、合法 reason。
+Webhook 自动写入时按 app 和 normalized_to_email 去重，complaint 可升级 hard_bounce，不覆盖 manual。
 email 按 normalized_to_email 规则归一化后匹配。
 reason 允许值固定为 hard_bounce、complaint、manual。
 ```
@@ -363,8 +364,10 @@ API Key 规则：
 ```text
 请求格式固定为 Authorization: Bearer {api_key}。
 第一阶段 API Key 明文建议前缀为 mk_live_ 或 mk_test_。
-API Key 最小长度 24 bytes，最大长度 128 bytes。
-鉴权时只返回 unauthorized，不暴露 key 是否存在、是否禁用或属于哪个 App。
+API Key 最小长度 24 bytes，最大长度 128 bytes，只允许可见 ASCII 字符，不允许空白字符、控制字符和非 ASCII 字符。
+解析后的 API Key 明文值必须在所有 App 中全局唯一，避免同一个 Bearer token 被多个 App 或被停用 key 抢先匹配。
+API Key 格式非法、未匹配或 key 已禁用时只返回 unauthorized，不暴露 key 是否存在、是否禁用或属于哪个 App。
+API Key 已匹配但 App 已停用时返回 app_disabled，不返回 App code、App name 或 API Key 元数据。
 JSONL 日志只记录 api_key_name，不记录 API Key 明文、哈希或前缀。
 Lite 模式加载 key_ref 后，内存中只保留 key_hash，不保留 API Key 明文。
 第一阶段 key_hash 使用 SHA-256(api_key) 的小写 hex。
@@ -398,7 +401,7 @@ mail-messages.jsonl:
   ts, request_id, business_request_id, message_id, app, api_key_name, scene, to_domain, to_hash, locale, status, idempotency_hash, request_fingerprint, caller_ip, user_ip, user_id_hash, error_code, error_message
 
 mail-attempts.jsonl:
-  ts, message_id, attempt_no, provider, provider_account, provider_channel, transport, status, failure_class, error_code, provider_message_id, duration_ms
+  ts, message_id, app, attempt_no, provider, provider_account, provider_channel, transport, status, failure_class, error_code, error_message, provider_message_id, duration_ms
 
 mail-stats.jsonl:
   ts, app, scene, provider_channel, transport, metric, value
@@ -406,6 +409,8 @@ mail-stats.jsonl:
 mail-events.jsonl:
   ts, message_id, app, provider, provider_account, provider_channel, provider_message_id, event_type, event_payload, occurred_at
 ```
+
+第一阶段 Webhook Receiver 不把原始 Provider Webhook Payload 或标准化请求中的原始 `event_payload` 写入 `mail-events.jsonl`。`event_payload` 只保存脱敏后的来源摘要，例如 `{"source":"resend"}`、`{"source":"brevo"}` 或 `{"source":"generic"}`。
 
 时间字段规则：
 
@@ -502,6 +507,7 @@ metric 固定为 messages_queued、messages_sent、messages_failed、attempts_se
 value 固定为 number；计数类 metric value 为 1，duration metric value 为毫秒。
 请求级 metric 的 provider_channel 和 transport 为空字符串。
 Provider attempt 级 metric 必须填写 provider_channel 和 transport。
+Lite Admin 统计摘要查询遇到无法解析的单行 stats 记录时跳过该行，避免单条损坏统计日志导致整个面板不可用；mail-messages、mail-attempts 和 mail-events 仍按审计状态源处理，解析失败应返回错误。
 ```
 
 发送尝试落盘规则：
@@ -521,7 +527,7 @@ JSONL 状态恢复规则：
 
 ```text
 同一个 message_id 的最新 mail-messages.jsonl 记录代表当前消息状态。
-同一个 message_id + attempt_no 的最新 mail-attempts.jsonl 记录代表当前尝试状态。
+同一个 app + message_id + attempt_no 的最新 mail-attempts.jsonl 记录代表当前尝试状态。
 Lite 模式启动时不扫描 JSONL 恢复未完成任务。
 PostgreSQL 模式以后通过状态表恢复 queued / retrying 任务。
 ```
@@ -533,7 +539,7 @@ PostgreSQL 模式以后通过状态表恢复 queued / retrying 任务。
 - 单 Docker 容器可直接运行。
 - 生产用户可以逐步打开 Redis 和 PostgreSQL。
 - 开源用户不需要一开始就理解完整分布式架构。
-- 后续管理后台可以在 PostgreSQL 模式下提供完整能力，在文件模式下提供只读或基础能力。
+- Lite Admin 在文件模式下提供只读和基础操作能力，完整动态配置管理仍放在 PostgreSQL 模式。
 
 ## 6. 推荐技术栈
 
@@ -567,6 +573,8 @@ Recharts
 标准模式：muxmail + redis
 完整模式：muxmail-api + muxmail-worker + postgres + redis + admin
 ```
+
+当前 Lite Admin 作为静态前端内置在单容器 `muxmail` 中，由同一个 HTTP 端口服务 `/admin/`。后台通过浏览器输入的 App API Key 调用现有 App-scoped API，只提供仪表盘、消息排查、Provider Event 查询、退信名单查询、测试发送和安全配置摘要，不在线编辑 YAML 配置、不显示 API Key、Provider Secret、Webhook Secret、SMTP 密码或运行时文件系统路径。
 
 第一阶段进程模型固定为：
 
@@ -654,15 +662,17 @@ POST /v1/provider-events/brevo
 
 `/healthz`、`/readyz` 和 `/version` 不需要 API Key，不输出配置、路径、密钥、Provider 状态或内部错误详情。`/version` 只返回 `VERSION` 文件嵌入进二进制的 SemVer 版本号。
 
-`GET /v1/mail/messages/{message_id}` 需要 App API Key，只能查询该 App 自己的消息。Lite 模式从 `mail-messages.jsonl` 和轮转备份中线性扫描同一 `message_id` 的最新状态记录。接口不返回完整收件人邮箱、邮件正文、模板变量、caller_ip、user_ip、API Key 哈希、幂等哈希或请求指纹。
+所有 `/v1/` API 响应第一阶段固定设置 `Cache-Control: no-store`、`Pragma: no-cache` 和 `Expires: 0`，避免浏览器或反向代理缓存 App-scoped 配置摘要、消息状态、退信名单或事件数据。`/admin/` HTML 入口同样使用 `no-store`，避免单容器升级后浏览器继续使用旧前端入口文件；构建产物中的静态 asset 仍按普通静态文件服务。
 
-`GET /v1/mail/messages` 需要 App API Key，只能查询该 App 自己的消息列表。Lite 模式从 `mail-messages.jsonl` 和轮转备份中线性扫描每个 `message_id` 的最新状态记录，再按 `updated_at` 倒序返回。默认 `limit=50`，最大 `200`；`status` 和 `scene` 可选过滤。接口返回与单条消息状态接口一致的安全字段集合，不返回完整收件人邮箱、正文、模板变量、caller_ip、user_ip、API Key 哈希、幂等哈希或请求指纹。
+`GET /v1/mail/messages/{message_id}` 需要 App API Key，只能查询该 App 自己的消息。Lite 模式从 `mail-messages.jsonl` 和轮转备份中线性扫描同一 `app + message_id` 的最新状态记录。接口不返回完整收件人邮箱、邮件正文、模板变量、caller_ip、user_ip、API Key 哈希、幂等哈希或请求指纹。
 
-`GET /v1/mail/messages/failed` 是固定 `status=failed` 的快捷入口，适合值班排障或后台失败消息列表。默认 `limit=50`，最大 `200`；`scene` 可选过滤。其返回字段与 `GET /v1/mail/messages` 相同。
+`GET /v1/mail/messages` 需要 App API Key，只能查询该 App 自己的消息列表。Lite 模式从 `mail-messages.jsonl` 和轮转备份中线性扫描每个 `app + message_id` 的最新状态记录，再按 `updated_at` 倒序返回。默认 `limit=50`，最大 `200`；`status` 和 `scene` 可选过滤，`scene` 必须符合 Scene code 标识符规则。接口返回与单条消息状态接口一致的安全字段集合，不返回完整收件人邮箱、正文、模板变量、caller_ip、user_ip、API Key 哈希、幂等哈希或请求指纹。
 
-`GET /v1/mail/messages/{message_id}/events` 需要 App API Key，只能查询该 App 自己的消息。Lite 模式从 `mail-events.jsonl` 和轮转备份中按时间顺序扫描同一 `message_id` 的事件记录。接口返回 `logged_at`、`provider`、`provider_account`、`provider_channel`、`provider_message_id`、`event_type`、`occurred_at`，不返回完整收件人邮箱，也不返回原始 Provider Webhook payload。
+`GET /v1/mail/messages/failed` 是固定 `status=failed` 的快捷入口，适合值班排障或后台失败消息列表。默认 `limit=50`，最大 `200`；`scene` 可选过滤，且必须符合 Scene code 标识符规则。其返回字段与 `GET /v1/mail/messages` 相同。
 
-`GET /v1/mail/messages/{message_id}/attempts` 需要 App API Key，只能查询该 App 自己的消息。Lite 模式从 `mail-attempts.jsonl` 和轮转备份中按时间顺序扫描同一 `message_id` 的 attempt 记录。接口返回 `logged_at`、`attempt_no`、`provider`、`provider_account`、`provider_channel`、`transport`、`status`、`failure_class`、`error_code`、`provider_message_id`、`duration_ms`，不返回收件人邮箱、正文或模板变量。
+`GET /v1/mail/messages/{message_id}/events` 需要 App API Key，只能查询该 App 自己的消息。Lite 模式从 `mail-events.jsonl` 和轮转备份中按时间顺序扫描同一 `app + message_id` 的事件记录。接口返回 `logged_at`、`provider`、`provider_account`、`provider_channel`、`provider_message_id`、`event_type`、`occurred_at`，不返回完整收件人邮箱，也不返回原始 Provider Webhook payload。
+
+`GET /v1/mail/messages/{message_id}/attempts` 需要 App API Key，只能查询该 App 自己的消息。Lite 模式从 `mail-attempts.jsonl` 和轮转备份中按时间顺序扫描同一 `app + message_id` 的 attempt 记录。接口返回 `logged_at`、`attempt_no`、`provider`、`provider_account`、`provider_channel`、`transport`、`status`、`failure_class`、`error_code`、`provider_message_id`、`duration_ms`，不返回收件人邮箱、正文或模板变量。运行期无法解析 `provider_channel` 时，该次 `channel_failure` attempt 仍返回，`provider`、`provider_account` 和 `transport` 可为空字符串。
 
 `GET /v1/suppressions` 需要 App API Key，只能查询该 App 自己的 suppression。默认 `limit=50`，最大 `200`；`reason` 和 `email` 可选过滤。该接口按用途返回 `email`、`normalized_email`、`reason`。这里允许返回完整邮箱，因为 suppression 管理、误封排查和人工清理本身就需要真实地址；这条规则只适用于受限的 App 自有查询接口，不改变 JSONL 日志和其他消息查询接口的脱敏要求。
 
@@ -670,13 +680,19 @@ POST /v1/provider-events/brevo
 
 `GET /v1/stats/summary` 需要 App API Key，只能聚合该 App 自己的统计。`window` 只允许 `1h`、`24h`、`7d`，默认 `24h`。`stats: off` 时返回空汇总；`stats: file` 时从 `mail-stats.jsonl` 和轮转备份中线性扫描并聚合 metric 总和，同时对 `provider_duration_ms` 按 provider_channel 输出 count、total_ms 和 average_ms。
 
-`POST /v1/provider-events` 默认关闭。启用时必须配置 `webhooks.shared_secret_ref`，请求使用 `Authorization: Bearer <webhook_shared_secret>`。该接口接收 MuxMail 标准事件。`bounced` 和 `complained` 事件必须带 `recipient_email`，这样 MuxMail 才能自动更新 `suppression.yaml`。完整收件人邮箱只用于 suppression 更新，不写入 JSONL 日志。
+`POST /v1/provider-events` 默认关闭。启用时必须配置 `webhooks.enabled: true` 和 `webhooks.shared_secret_ref`，请求使用 `Authorization: Bearer <webhook_shared_secret>`。该接口接收 MuxMail 标准事件。`bounced` 和 `complained` 事件必须带合法的单个 addr-spec `recipient_email`，这样 MuxMail 才能自动更新 `suppression.yaml`。完整收件人邮箱只用于 suppression 更新，不写入 JSONL 日志。
 
-Webhook 事件去重规则固定为：`app + message_id + provider + provider_account + provider_channel + provider_message_id + event_type + occurred_at`。同一 identity 的重复事件直接忽略，不重复追加 `mail-events.jsonl`、不重复推进消息状态、也不重复修改 suppression。
+Webhook 写入 suppression 时按 App + normalized email upsert；`complaint` 可把已有 `hard_bounce` 升级为 `complaint`，但不得覆盖人工维护的 `manual` 条目，也不得把 `complaint` 降级回 `hard_bounce`。
 
-`POST /v1/provider-events/resend` 使用 Resend 官方 Svix 签名头：`svix-id`、`svix-timestamp`、`svix-signature`。启用时必须配置 `webhooks.resend_secret_ref`，签名时间窗口固定为 5 分钟。MuxMail 发送 Resend API 邮件时写入 tags：`app`、`message_id`、`provider_account`、`provider_channel`，Resend webhook 必须携带这些 tags 才能关联并推进消息状态。第一版只映射 `email.delivered`、`email.bounced`、`email.complained`。对 bounce / complaint 事件，还要求 webhook payload 提供收件人邮箱，用于自动写入 suppression。
+所有 Webhook 事件必须带完整 `provider_account`、`provider_channel` 和 `provider_message_id`。正常情况下，事件中的 `app + message_id + provider + provider_account + provider_channel + provider_message_id` 必须匹配同一 App、同一消息下已记录的 `sent` attempt。如果服务商 accepted 响应没有返回 provider id，`sent` attempt 允许记录空 `provider_message_id`；这种情况下认证后的 Webhook 事件仍必须提供 `provider_message_id`，并且 `app + message_id + provider + provider_account + provider_channel` 必须匹配该 `sent` attempt。匹配失败时返回 `invalid_json`，不得追加 `mail-events.jsonl`、不得推进消息状态、不得修改 suppression。
 
-`POST /v1/provider-events/brevo` 启用时必须配置 `webhooks.brevo_token_ref`，请求使用 `Authorization: Bearer <brevo_webhook_token>`。MuxMail 发送 Brevo API 邮件时写入 tags：`app:...`、`message_id:...`、`provider_account:...`、`provider_channel:...`。Brevo webhook 通过这些 tags 关联消息。第一版映射 `delivered -> delivered`、`hardBounce -> bounced`、`spam -> complained`，并兼容 `hard_bounce`、`invalid_email` 的 bounce 映射。对 bounce / complaint 事件，还要求 webhook payload 提供收件人邮箱，用于自动写入 suppression。
+Webhook 事件去重规则固定为：`app + message_id + provider + provider_account + provider_channel + provider_message_id + event_type + occurred_at`。同一 identity 的重复事件不重复追加 `mail-events.jsonl`；为了修复第一次处理时在追加事件后失败的场景，重复事件仍可重放幂等 suppression 更新，并按单调规则补写缺失的消息状态。
+
+Webhook 状态推进规则固定为单调追加：`sent` 可推进到 `delivered`、`bounced` 或 `complained`；`delivered` 可被后续 `bounced` 或 `complained` 覆盖；`bounced` 只可进一步推进到 `complained`；`failed` 和 `complained` 不再被 Webhook 覆盖；迟到的 `delivered` 不得把 `bounced` 或 `complained` 回滚为 `delivered`。不参与状态推进的非重复事件仍追加到 `mail-events.jsonl`，bounce / complaint 仍按规则更新 suppression。
+
+`POST /v1/provider-events/resend` 使用 Resend 官方 Svix 签名头：`svix-id`、`svix-timestamp`、`svix-signature`。启用时必须配置 `webhooks.enabled: true` 和 `webhooks.resend_secret_ref`，签名时间窗口固定为 5 分钟。MuxMail 发送 Resend API 邮件时写入 tags：`app`、`message_id`、`provider_account`、`provider_channel`，Resend webhook 必须携带这些 tags 才能关联并推进消息状态。第一版只映射 `email.delivered`、`email.bounced`、`email.complained`。对 bounce / complaint 事件，还要求 webhook payload 提供合法的单个 addr-spec 收件人邮箱，用于自动写入 suppression。
+
+`POST /v1/provider-events/brevo` 启用时必须配置 `webhooks.enabled: true` 和 `webhooks.brevo_token_ref`，请求使用 `Authorization: Bearer <brevo_webhook_token>`。MuxMail 发送 Brevo API 邮件时写入 tags：`app:...`、`message_id:...`、`provider_account:...`、`provider_channel:...`。Brevo webhook 通过这些 tags 关联消息，并必须提供 `ts_event`，MuxMail 将其转换为 UTC RFC3339 `occurred_at`；不使用 Brevo `date` 字段作为审计时间，因为该字段不携带时区。第一版映射 `delivered -> delivered`、`hardBounce -> bounced`、`spam -> complained`，并兼容 `hard_bounce`、`invalid_email` 的 bounce 映射。对 bounce / complaint 事件，还要求 webhook payload 提供合法的单个 addr-spec 收件人邮箱，用于自动写入 suppression。
 
 健康检查响应体固定为：
 
@@ -762,7 +778,7 @@ Provider Adapter 返回结果必须归一化为：
 
 ```text
 accepted:
-  provider_message_id
+  provider_message_id（服务商 accepted 响应未提供时允许为空，不得仅因缺失该字段重试）
 
 failed:
   failure_class: temporary_failure | channel_failure | message_permanent_failure
@@ -829,7 +845,7 @@ sequenceDiagram
     W->>CS: 读取邮件场景与路由策略
     W->>W: 选择 Provider Channel
     W->>P: 通过 API 或 SMTP Transport 发信
-    P-->>W: 返回 provider_message_id 或错误
+    P-->>W: 返回 accepted（可能带 provider_message_id）或错误
     W->>ML: 记录 attempt
     W->>ML: 更新 message 状态
 ```
@@ -913,7 +929,8 @@ Content-Type: application/json
 - App 身份由 API Key 识别，不建议由业务系统在 body 里传 `app_id`。
 - Template 由 Scene 绑定，业务请求不传 `template`，避免客户端绕过场景策略。
 - `locale` 用于选择邮件内容语言；未传时使用 App 的 `default_locale`，传入时必须是 App 的 `allowed_locales` 之一。
-- `context.user_ip` 可以用于风控，但 MuxMail 仍应记录调用方真实 IP。
+- `context.user_ip` 可以用于风控，传入时必须是字符串形式的合法 IPv4 或 IPv6；MuxMail 仍应记录调用方真实 IP。
+- `context.user_ip`、`context.user_id` 和 `context.request_id` 是 MuxMail 识别的保留 context 字段，存在时必须是字符串。
 - `Idempotency-Key` 第一阶段必填，用于防止业务系统重试时重复发送。
 - 响应里的 `request_id` 由 MuxMail 生成；业务传入的 `context.request_id` 只作为业务追踪字段记录。
 - `queued` 只表示 MuxMail 已接受请求并写入队列，不表示服务商已接收或用户已收到邮件。
@@ -979,6 +996,7 @@ context.request_id 最大 128 bytes，只允许可见 ASCII 字符，不允许�
 `vars` 第一阶段固定为扁平 JSON object：
 
 ```text
+vars 可选，缺省时按空对象处理
 允许值类型：string、number、boolean
 不允许：object、array、null
 不允许字段名为空
@@ -1015,26 +1033,28 @@ context.request_id 最大 128 bytes，只允许可见 ASCII 字符，不允许�
 11. 命中幂等重放时直接返回首次 message_id，不执行后续步骤。
 12. 检查 suppression list。
 13. 计算收件邮箱域名并匹配 route_policy，确认至少存在一个候选 Provider Channel。
-14. 执行并占用 Rate Limit。
-15. 写 queued message JSONL。
-16. 写入 Queue。
-17. 将幂等缓存标记为 queued。
-18. 返回 202 Accepted。
+14. 预留内存 Queue 容量；如果队列已满，返回 queue_full 且不占用 Rate Limit。
+15. 执行并占用 Rate Limit。
+16. 写 queued message JSONL。
+17. 将任务提交到已预留的 Queue 槽位。
+18. 将幂等缓存标记为 queued。
+19. 返回 202 Accepted。
 ```
 
-`template_render_failed`、`missing_template_var`、`suppressed_recipient` 和 `route_not_found` 都发生在限流占用前，不消耗 Rate Limit。
+`template_render_failed`、`missing_template_var`、`suppressed_recipient`、`route_not_found` 和 `queue_full` 都不消耗 Rate Limit；`queue_full` 通过先预留内存 Queue 槽位保证发生在限流占用前。
 
 Lite 模式入队事务顺序固定为：
 
 ```text
-1. 先执行幂等检查，不创建最终幂等成功记录。
-2. 再执行限流计数占用。
-3. 再写入 queued message JSONL。
-4. 再写入内存 Queue。
-5. Queue 写入成功后，才把幂等缓存标记为 queued。
+1. 先执行幂等检查并创建 pending 预留，不创建最终 queued 记录。
+2. 再预留内存 Queue 容量；queue_full 会释放 pending 幂等预留且不占用 Rate Limit。
+3. 再执行限流计数占用。
+4. 再写入 queued message JSONL。
+5. 再将任务提交到已预留的内存 Queue 槽位。
+6. Queue 提交成功后，才把幂等缓存标记为 queued。
 ```
 
-如果 MessageLog 或 Queue 写入失败，返回 `500 internal_error`，不得返回 `queued`。Lite 模式不回滚已经占用的内存限流计数，因为失败率应由结构化日志暴露，避免为了回滚引入复杂状态补偿。
+如果 MessageLog 或 Queue 提交在限流占用后失败，返回 `500 internal_error`，不得返回 `queued`。Lite 模式会释放内存 Queue 预留、释放 pending 幂等预留，并回滚本次请求占用的内存限流计数，确保只有已经成功落盘并入队的 accepted 请求消耗 Rate Limit。
 
 错误响应结构固定为：
 
@@ -1091,13 +1111,14 @@ MuxMail 的多语言分为两个独立层面：管理面板多语言和邮件内
 
 管理面板只影响 MuxMail 后台操作者看到的界面语言，不影响发给用户的邮件语言。
 
-第一阶段不实现管理后台。第二阶段后台多语言规则固定为：
+Lite Admin 管理面板多语言规则固定为：
 
 ```text
 默认语言：en-US
 首批语言：en-US、zh-CN
-前端 i18n 文件路径：web/admin/src/locales/{locale}.json
-用户语言选择存储：浏览器 localStorage
+前端 i18n 文件路径：web/admin/src/i18n.ts
+用户语言选择和当前导航视图存储：浏览器 localStorage
+App API Key 只保存在当前页面内存，不写入 localStorage、sessionStorage 或 IndexedDB
 服务端错误返回稳定 error_code，前端按当前 locale 翻译展示
 ```
 
@@ -1321,7 +1342,7 @@ suppression_file: data/suppression.yaml
 
 ```text
 plain:change-me              仅用于本地示例
-plain:muxmail_example_key    仅用于本地临时配置
+plain:muxmail_example_key_123456    仅用于本地临时配置
 env:BREVO_API_KEY            从环境变量读取
 file:/run/secrets/brevo_key  从文件读取
 ```
@@ -1366,7 +1387,7 @@ muxmail send dry-run -c config.yaml --app project_a --scene register_code --to u
 }
 ```
 
-`dry-run` 不输出完整收件人邮箱、模板变量、验证码、Provider Secret 或 API Key。
+`dry-run` 不输出完整收件人邮箱、模板变量、验证码、Provider Secret 或 API Key；`subject_preview` 中的模板变量值必须使用脱敏占位符。
 
 `config validate` 必须检查：
 
@@ -1375,15 +1396,20 @@ App code 唯一。
 App default_locale 必须包含在 allowed_locales 内。
 App default_locale 和 allowed_locales 必须符合 Locale 格式规则。
 API Key name 在同一个 App 内唯一。
+API Key 解析后的值必须为 24 到 128 bytes，只允许可见 ASCII 字符、不允许空白字符，且所有 App 中不能重复。
 Scene code 在同一个 App 内唯一。
 Template code + locale 在同一个 App 内唯一。
 Template locale 必须包含在所属 App 的 allowed_locales 内。
 Template locale 必须符合 Locale 格式规则。
+Template subject 必填，且 subject、html_body 和 text_body 必须能被 Go template 解析。
+Template 至少配置 html_body 或 text_body 之一。
+Template required_vars 名称必须符合请求 vars 字段名规则。
 Provider Account code 唯一。
 Provider Channel code 唯一。
 Provider Account 的 provider 必须属于第一阶段支持列表：mock、resend、brevo。
 Provider Channel 的 transport 必须属于对应 Provider 支持列表。
 Route Policy 中引用的 Provider Channel 必须存在且启用。
+Route Policy 的同一个路由规则内不能重复引用同一个 Provider Channel。
 Route Policy 必须包含 "*" 默认路由。
 Scene 只能引用同一个 App 内的 Template。
 Provider Channel 的 from 邮箱域名必须等于 sender_domain。
@@ -1391,15 +1417,16 @@ SMTP Channel 必须配置 host、port、username。
 SMTP Channel 第一阶段 port 必须为 587。
 Scene 引用的 Template 至少存在 App default_locale 版本。
 所有 env: 和 file: 密钥引用必须可解析，包括 key_ref、credentials 和 smtp.password_ref。
+所有密钥引用解析后的值必须非空。
 plain: 密钥引用第一阶段允许通过，但 config validate 必须输出 warning。
-suppression.yaml 如果存在，必须能解析且 reason 必须属于 hard_bounce、complaint、manual。
+suppression.yaml 如果存在，必须能解析，且每个条目必须包含非空 app、合法的单个 ASCII addr-spec email、hard_bounce/complaint/manual reason。
 Rate Limit 数值必须大于 0。
 memory_queue_size 必须大于 0。
 worker_concurrency 必须大于 0。
 idempotency_cache_size 必须大于 0。
 idempotency_ttl_hours 必须大于 0。
 max_attempts_per_message 必须大于 0，第一阶段最大值为 3。
-retry_backoff_seconds 数量必须等于 max_attempts_per_message。
+retry_backoff_seconds 数量必须等于 max_attempts_per_message，首项必须为 0，每项必须在 0 到 300 秒之间。
 max_request_body_bytes、max_template_var_bytes、max_context_bytes 必须大于 0。
 server timeout 数值必须大于 0。
 logging.max_file_size_mb 必须大于 0。
@@ -1758,10 +1785,13 @@ IP 来源规则：
 ```text
 默认情况下 caller_ip 使用 HTTP 连接的 remote address。
 只有 server.trusted_proxies 命中连接来源 IP 时，才信任 X-Forwarded-For 或 X-Real-IP。
-X-Forwarded-For 优先级高于 X-Real-IP，并固定取第一个合法 IP。
+X-Forwarded-For 优先级高于 X-Real-IP，并只信任第一个条目；第一个条目不是合法 IP 时，该 header 视为无效。
 server.trusted_proxies 支持精确 IP 和 CIDR，例如 127.0.0.1、10.0.0.0/8、::1/128。
+server.trusted_proxies 禁止全网信任前缀，例如 0.0.0.0/0、::/0、::ffff:0.0.0.0/96；配置校验必须返回 trusted_proxy_invalid。
 客户端传入的 caller_ip 永远不可信。
 context.user_ip 由业务系统传入，只作为最终用户 IP 风控维度。
+context.user_ip 非空时必须是字符串形式的合法 IPv4 或 IPv6。
+context.user_ip、context.user_id 和 context.request_id 存在时必须是字符串。
 context.user_ip 缺失时跳过 user_ip_hour 限流，仍执行 email 和 caller_ip 限流。
 ```
 
@@ -1875,10 +1905,11 @@ message_permanent_failure 不切换通道，直接标记消息 failed。
 - JSONL 发送日志
 - 配置校验和 dry-run 命令
 - 单容器 Docker 部署
+- Lite Admin 只读管理界面和基础操作
 
 第二阶段再做：
 
-- 管理后台
+- 完整动态配置管理后台
 - PostgreSQL 配置存储和发送记录
 - Redis 队列和分布式限流
 - 服务商 Webhook
@@ -1895,7 +1926,7 @@ message_permanent_failure 不切换通道，直接标记消息 failed。
 ```text
 不做多租户 Tenant。
 不做营销邮件批量群发。
-不做后台管理 UI。
+不做在线编辑 YAML 或 Provider Secret 的动态配置后台。
 不做配置热更新。
 不做 SMTP Server。
 不做打开率、点击率追踪。
@@ -1913,10 +1944,11 @@ message_permanent_failure 不切换通道，直接标记消息 failed。
 5. 增加限流和幂等。
 6. 增加配置校验和 dry-run 命令。
 7. 增加 JSONL 发送日志和尝试记录。
-8. 增加 Redis 队列和 Redis 限流。
-9. 增加 PostgreSQL 存储。
-10. 增加 Webhook 和投递事件。
-11. 增加后台管理和统计。
+8. 增加 Lite Admin 只读管理界面和基础操作。
+9. 增加 Redis 队列和 Redis 限流。
+10. 增加 PostgreSQL 存储。
+11. 增加 Webhook 和投递事件。
+12. 增加完整动态配置管理后台和统计。
 ```
 
 ## 18. 关键原则

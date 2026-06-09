@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const (
@@ -14,6 +15,7 @@ const (
 )
 
 type jsonlWriter struct {
+	mu          sync.Mutex
 	path        string
 	maxBytes    int64
 	maxBackups  int
@@ -46,13 +48,21 @@ func newJSONLWriter(path string, maxBytes int64, maxBackups int) (*jsonlWriter, 
 }
 
 func (w *jsonlWriter) appendLine(line []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.appendLineLocked(line)
+}
+
+// appendLineLocked writes one JSONL record while the caller holds w.mu.
+func (w *jsonlWriter) appendLineLocked(line []byte) error {
 	if w.file == nil {
 		return fmt.Errorf("jsonl writer is closed")
 	}
 
 	lineLength := int64(len(line) + 1)
 	if w.currentSize > 0 && w.currentSize+lineLength > w.maxBytes {
-		if err := w.rotate(); err != nil {
+		if err := w.rotateLocked(); err != nil {
 			return err
 		}
 	}
@@ -72,6 +82,13 @@ func (w *jsonlWriter) appendLine(line []byte) error {
 }
 
 func (w *jsonlWriter) close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.closeLocked()
+}
+
+func (w *jsonlWriter) closeLocked() error {
 	if w.file == nil {
 		return nil
 	}
@@ -112,8 +129,8 @@ func (w *jsonlWriter) open() error {
 	return nil
 }
 
-func (w *jsonlWriter) rotate() error {
-	if err := w.close(); err != nil {
+func (w *jsonlWriter) rotateLocked() error {
+	if err := w.closeLocked(); err != nil {
 		return fmt.Errorf("close jsonl before rotate: %w", err)
 	}
 

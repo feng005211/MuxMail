@@ -50,6 +50,12 @@ type MemoryQueue struct {
 	notify   chan struct{}
 }
 
+// QueueReservation holds queue capacity while the caller finishes durable audit work.
+type QueueReservation struct {
+	queue *MemoryQueue
+	used  bool
+}
+
 // NewMemoryQueue creates an in-memory queue with fixed capacity.
 func NewMemoryQueue(config MemoryQueueConfig) (*MemoryQueue, error) {
 	if config.Capacity <= 0 {
@@ -73,14 +79,54 @@ func (q *MemoryQueue) Enqueue(task QueueTask) error {
 
 // EnqueueDelayed adds a task that becomes available after delay.
 func (q *MemoryQueue) EnqueueDelayed(task QueueTask, delay time.Duration) error {
+	reservation, err := q.Reserve()
+	if err != nil {
+		return err
+	}
+	return reservation.CommitDelayed(task, delay)
+}
+
+// Reserve atomically claims one queue capacity slot for a later enqueue.
+func (q *MemoryQueue) Reserve() (*QueueReservation, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if q.closed {
-		return ErrMemoryQueueClosed
+		return nil, ErrMemoryQueueClosed
 	}
 	if q.pending >= q.capacity {
-		return QueueFullError{Code: domain.ErrorCodeQueueFull}
+		return nil, QueueFullError{Code: domain.ErrorCodeQueueFull}
+	}
+	q.pending++
+
+	return &QueueReservation{queue: q}, nil
+}
+
+// Commit enqueues an immediately available task into the reserved capacity slot.
+func (r *QueueReservation) Commit(task QueueTask) error {
+	return r.CommitDelayed(task, 0)
+}
+
+// CommitDelayed enqueues a delayed task into the reserved capacity slot.
+func (r *QueueReservation) CommitDelayed(task QueueTask, delay time.Duration) error {
+	if r == nil || r.queue == nil {
+		return fmt.Errorf("queue reservation is required")
+	}
+
+	q := r.queue
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if r.used {
+		return fmt.Errorf("queue reservation already used")
+	}
+	r.used = true
+
+	if q.closed {
+		if q.pending > 0 {
+			q.pending--
+		}
+		return ErrMemoryQueueClosed
 	}
 	if delay < 0 {
 		delay = 0
@@ -101,10 +147,29 @@ func (q *MemoryQueue) EnqueueDelayed(task QueueTask, delay time.Duration) error 
 	} else {
 		heap.Push(&q.delayed, item)
 	}
-	q.pending++
 	q.signalLocked()
 
 	return nil
+}
+
+// Release returns reserved capacity when the caller cannot commit the task.
+func (r *QueueReservation) Release() {
+	if r == nil || r.queue == nil {
+		return
+	}
+
+	q := r.queue
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if r.used {
+		return
+	}
+	r.used = true
+	if q.pending > 0 {
+		q.pending--
+	}
+	q.signalLocked()
 }
 
 // Dequeue waits until a task is ready, the context is canceled, or the queue closes.

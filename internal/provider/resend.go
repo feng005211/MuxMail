@@ -23,6 +23,7 @@ type ResendAPIProvider struct {
 	secrets SecretResolver
 	client  *http.Client
 	baseURL string
+	now     func() time.Time
 }
 
 // ResendAPIOption customizes the Resend API provider.
@@ -34,6 +35,7 @@ func NewResendAPIProvider(secrets SecretResolver, options ...ResendAPIOption) *R
 		secrets: secrets,
 		client:  &http.Client{Timeout: defaultResendHTTPTimeout},
 		baseURL: defaultResendBaseURL,
+		now:     time.Now,
 	}
 	for _, option := range options {
 		option(provider)
@@ -60,6 +62,15 @@ func WithResendBaseURL(baseURL string) ResendAPIOption {
 	}
 }
 
+// WithResendNow overrides the clock used to interpret HTTP-date Retry-After headers.
+func WithResendNow(now func() time.Time) ResendAPIOption {
+	return func(provider *ResendAPIProvider) {
+		if now != nil {
+			provider.now = now
+		}
+	}
+}
+
 // Send sends one message through the Resend Email API.
 func (p *ResendAPIProvider) Send(ctx context.Context, request SendRequest) (SendResult, error) {
 	if err := ctx.Err(); err != nil {
@@ -68,12 +79,19 @@ func (p *ResendAPIProvider) Send(ctx context.Context, request SendRequest) (Send
 	if request.Account.Provider != domain.ProviderResend || request.Channel.Transport != domain.TransportAPI {
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "resend api transport required"), nil
 	}
+	envelope, result, failed := normalizeProviderEnvelope(request)
+	if failed {
+		return result, nil
+	}
 
 	apiKey, err := p.apiKey(request)
 	if err != nil {
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "resend api key unavailable"), nil
 	}
-	payload, err := buildResendPayload(request)
+	if !isVisibleASCIIWithoutWhitespaceSecret(apiKey) {
+		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "resend api key invalid"), nil
+	}
+	payload, err := buildResendPayload(request, envelope)
 	if err != nil {
 		return MessagePermanentFailure(domain.ErrorCodeInternal, "resend message build failed"), nil
 	}
@@ -103,7 +121,7 @@ func (p *ResendAPIProvider) Send(ctx context.Context, request SendRequest) (Send
 	}
 	defer response.Body.Close()
 
-	return decodeResendResponse(response), nil
+	return decodeResendResponse(response, p.now), nil
 }
 
 func (p *ResendAPIProvider) apiKey(request SendRequest) (string, error) {
@@ -144,20 +162,20 @@ type resendTag struct {
 	Value string `json:"value"`
 }
 
-func buildResendPayload(request SendRequest) (resendEmailPayload, error) {
+func buildResendPayload(request SendRequest, envelope providerEnvelope) (resendEmailPayload, error) {
 	if request.Message.HTMLBody == "" && request.Message.TextBody == "" {
 		return resendEmailPayload{}, fmt.Errorf("message body is required")
 	}
-	if request.Channel.From == "" || request.Message.ToEmail == "" || request.Message.Subject == "" {
-		return resendEmailPayload{}, fmt.Errorf("message address and subject are required")
+	if request.Message.Subject == "" {
+		return resendEmailPayload{}, fmt.Errorf("message subject is required")
 	}
 
 	return resendEmailPayload{
 		From: (&mail.Address{
 			Name:    request.Channel.FromName,
-			Address: request.Channel.From,
+			Address: envelope.from,
 		}).String(),
-		To:      []string{strings.TrimSpace(request.Message.ToEmail)},
+		To:      []string{envelope.to},
 		Subject: request.Message.Subject,
 		HTML:    request.Message.HTMLBody,
 		Text:    request.Message.TextBody,
@@ -180,19 +198,20 @@ type resendErrorResponse struct {
 	StatusCode int    `json:"statusCode"`
 }
 
-func decodeResendResponse(response *http.Response) SendResult {
+func decodeResendResponse(response *http.Response, now func() time.Time) SendResult {
 	if response.StatusCode >= 200 && response.StatusCode <= 299 {
 		var accepted resendAcceptedResponse
-		if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil || accepted.ID == "" {
-			return TemporaryFailure(domain.ErrorCodeProviderUnavailable, "resend accepted response invalid")
+		if err := json.NewDecoder(response.Body).Decode(&accepted); err == nil && accepted.ID != "" {
+			return Accepted(accepted.ID)
 		}
 
-		return Accepted(accepted.ID)
+		// A 2xx response means Resend accepted the request; retrying here can duplicate delivery.
+		return Accepted("")
 	}
 
 	errorResponse := readResendError(response)
 	result := classifyResendHTTPFailure(response.StatusCode, errorResponse)
-	if retryAfter := parseRetryAfterSeconds(response.Header.Get("Retry-After")); retryAfter > 0 {
+	if retryAfter := parseRetryAfterSeconds(response.Header.Get("Retry-After"), now); retryAfter > 0 {
 		result = WithRetryAfter(result, retryAfter)
 	}
 
@@ -216,6 +235,8 @@ func classifyResendHTTPFailure(statusCode int, errorResponse resendErrorResponse
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "resend channel failure")
 	case errorName == "invalid_from_address" || errorName == "invalid_access":
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "resend channel failure")
+	case containsSenderConfigurationHint(errorResponse.Message):
+		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "resend channel failure")
 	case containsDomainVerificationHint(errorResponse.Message):
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "resend channel failure")
 	case statusCode == http.StatusBadRequest || statusCode == http.StatusUnprocessableEntity:
@@ -230,7 +251,12 @@ func containsDomainVerificationHint(message string) bool {
 	return strings.Contains(normalized, "domain") && strings.Contains(normalized, "verif")
 }
 
-func parseRetryAfterSeconds(value string) int {
+func containsSenderConfigurationHint(message string) bool {
+	normalized := strings.ToLower(message)
+	return strings.Contains(normalized, "from") || strings.Contains(normalized, "sender")
+}
+
+func parseRetryAfterSeconds(value string, now func() time.Time) int {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return 0
@@ -239,11 +265,20 @@ func parseRetryAfterSeconds(value string) int {
 		return seconds
 	}
 	if retryAt, err := http.ParseTime(value); err == nil {
-		seconds := int(time.Until(retryAt).Seconds())
-		if seconds > 0 {
-			return seconds
+		if now == nil {
+			now = time.Now
 		}
+		return retryAfterSecondsUntil(now(), retryAt)
 	}
 
 	return 0
+}
+
+func retryAfterSecondsUntil(now time.Time, retryAt time.Time) int {
+	duration := retryAt.Sub(now)
+	if duration <= 0 {
+		return 0
+	}
+
+	return int((duration + time.Second - time.Nanosecond) / time.Second)
 }

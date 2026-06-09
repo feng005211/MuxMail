@@ -38,6 +38,18 @@ func TestRunVersionOutputsEmbeddedVersion(t *testing.T) {
 	}
 }
 
+func TestRunHelpMarksDryRunLocaleOptional(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	if err := run([]string{"help"}, &stdout, &stderr); err != nil {
+		t.Fatalf("expected help command to succeed: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "[--locale en-US]") {
+		t.Fatalf("expected help to mark dry-run locale optional, got %q", stdout.String())
+	}
+}
+
 func TestRunServeRequiresConfigPath(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -54,7 +66,7 @@ func TestRunServeRequiresConfigPath(t *testing.T) {
 func TestRunConfigValidateLoadsConfig(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
-	writeConfigFile(t, configPath, "apps: []\n")
+	writeConfigFile(t, configPath, dryRunTestConfig(t, dir))
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -106,6 +118,12 @@ func TestRunServeReturnsWhenListenFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "bind") && !strings.Contains(err.Error(), "address already in use") {
 		t.Fatalf("expected listen failure, got %q", err.Error())
 	}
+	if !strings.Contains(stderr.String(), "warning plain_secret_ref apps[0].api_keys[0].key_ref") {
+		t.Fatalf("expected serve to print validation warnings, got %q", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "listening") {
+		t.Fatalf("expected listen failure not to print success message, got %q", stdout.String())
+	}
 }
 
 func TestRunSendDryRunOutputsRouteAndRenderPreview(t *testing.T) {
@@ -141,7 +159,7 @@ func TestRunSendDryRunOutputsRouteAndRenderPreview(t *testing.T) {
 	if len(output.SelectedChannels) != 2 || output.SelectedChannels[0] != "mock_auth_api" || output.SelectedChannels[1] != "mock_auth_backup" {
 		t.Fatalf("unexpected dry-run selected channels: %+v", output.SelectedChannels)
 	}
-	if output.SubjectPreview != "Your verification code is 123456" {
+	if output.SubjectPreview != "Your verification code is [redacted]" {
 		t.Fatalf("unexpected subject preview: %q", output.SubjectPreview)
 	}
 	if !output.HTMLRendered || !output.TextRendered {
@@ -149,6 +167,37 @@ func TestRunSendDryRunOutputsRouteAndRenderPreview(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), "user@example.com") {
 		t.Fatalf("dry-run output must not include full recipient: %s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "123456") {
+		t.Fatalf("dry-run output must not include template variable values: %s", stdout.String())
+	}
+}
+
+func TestRunSendDryRunUsesDefaultLocaleWhenOmitted(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeConfigFile(t, configPath, dryRunTestConfig(t, dir))
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := run([]string{
+		"send", "dry-run",
+		"--config", configPath,
+		"--app", "project_a",
+		"--scene", "register_code",
+		"--to", "user@example.com",
+		"--var", "code=123456",
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("expected dry-run without locale to use default locale: %v\nstderr=%s", err, stderr.String())
+	}
+
+	var output dryRunOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatalf("decode dry-run output: %v\n%s", err, stdout.String())
+	}
+	if output.Locale != "en-US" || output.Template != "register_code_v1" {
+		t.Fatalf("expected default locale render output, got %+v", output)
 	}
 }
 
@@ -172,6 +221,29 @@ func TestRunSendDryRunFailsWhenTemplateVarMissing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "missing_template_var") {
 		t.Fatalf("expected missing_template_var, got %q", err.Error())
+	}
+}
+
+func TestRunSendDryRunRejectsDisabledApp(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	writeConfigFile(t, configPath, strings.Replace(dryRunTestConfig(t, dir), "enabled: true", "enabled: false", 1))
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := run([]string{
+		"send", "dry-run",
+		"-c", configPath,
+		"--app", "project_a",
+		"--scene", "register_code",
+		"--to", "user@example.com",
+		"--var", "code=123456",
+	}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected disabled app dry-run to fail")
+	}
+	if !strings.Contains(err.Error(), "app disabled") {
+		t.Fatalf("expected app disabled error, got %q", err.Error())
 	}
 }
 
@@ -245,7 +317,7 @@ apps:
     api_keys:
       - name: default
         enabled: true
-        key_ref: plain:test_key
+        key_ref: plain:mk_test_cli_fixture_key_123456
     templates:
       - code: register_code_v1
         locale: en-US

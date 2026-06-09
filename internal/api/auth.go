@@ -2,17 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/muxmail/muxmail/internal/config"
 	"github.com/muxmail/muxmail/internal/domain"
-)
-
-const (
-	minAPIKeyBytes = 24
-	maxAPIKeyBytes = 128
 )
 
 type authContextKey struct{}
@@ -48,6 +44,7 @@ func NewAuthenticator(apps []config.AppConfig, resolver config.SecretResolver) (
 	authenticator := &Authenticator{
 		apps: make([]domain.App, 0, len(apps)),
 	}
+	seenKeyHashes := make(map[string]string)
 	for appIndex, appConfig := range apps {
 		apiKeys := make([]domain.APIKeyMetadata, 0, len(appConfig.APIKeys))
 		for keyIndex, keyConfig := range appConfig.APIKeys {
@@ -55,10 +52,19 @@ func NewAuthenticator(apps []config.AppConfig, resolver config.SecretResolver) (
 			if err != nil {
 				return nil, fmt.Errorf("resolve api key apps[%d].api_keys[%d]: %w", appIndex, keyIndex, err)
 			}
+			if !domain.IsValidAPIKeyValue(resolved.Value) {
+				return nil, fmt.Errorf("api key apps[%d].api_keys[%d] has invalid value", appIndex, keyIndex)
+			}
+			keyHash := domain.APIKeyHash(resolved.Value)
+			keyPath := fmt.Sprintf("apps[%d].api_keys[%d]", appIndex, keyIndex)
+			if firstPath, exists := seenKeyHashes[keyHash]; exists {
+				return nil, fmt.Errorf("api key %s duplicates %s", keyPath, firstPath)
+			}
+			seenKeyHashes[keyHash] = keyPath
 			apiKeys = append(apiKeys, domain.APIKeyMetadata{
 				Name:    keyConfig.Name,
 				Enabled: config.EnabledValue(keyConfig.Enabled),
-				KeyHash: domain.APIKeyHash(resolved.Value),
+				KeyHash: keyHash,
 			})
 		}
 		authenticator.apps = append(authenticator.apps, domainAppFromConfig(appConfig, apiKeys))
@@ -70,7 +76,7 @@ func NewAuthenticator(apps []config.AppConfig, resolver config.SecretResolver) (
 // AuthenticateHeader resolves the App and API key metadata from an Authorization header.
 func (a *Authenticator) AuthenticateHeader(header string) (AuthContext, error) {
 	apiKey, ok := parseBearerToken(header)
-	if !ok || len(apiKey) < minAPIKeyBytes || len(apiKey) > maxAPIKeyBytes {
+	if !ok || !domain.IsValidAPIKeyValue(apiKey) {
 		return AuthContext{}, AuthError{Code: domain.ErrorCodeUnauthorized, Message: "unauthorized"}
 	}
 
@@ -119,12 +125,12 @@ func AuthFromContext(ctx context.Context) (AuthContext, bool) {
 }
 
 func parseBearerToken(header string) (string, bool) {
-	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) {
+	fields := strings.Fields(header)
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
 		return "", false
 	}
 
-	token := strings.TrimPrefix(header, prefix)
+	token := fields[1]
 	if token == "" || strings.ContainsAny(token, " \t\r\n") {
 		return "", false
 	}
@@ -147,5 +153,11 @@ func writeAuthError(w http.ResponseWriter, err error) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = fmt.Fprintf(w, `{"error":{"code":"%s","message":"%s","request_id":""}}`, code, message)
+	_ = json.NewEncoder(w).Encode(errorResponse{
+		Error: errorPayload{
+			Code:      code,
+			Message:   message,
+			RequestID: "",
+		},
+	})
 }

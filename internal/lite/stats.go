@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/muxmail/muxmail/internal/domain"
@@ -30,6 +32,12 @@ const (
 	MetricRequestsQueueFull = "requests_queue_full"
 	// MetricRequestsIdempotentReplay counts idempotent replay requests.
 	MetricRequestsIdempotentReplay = "requests_idempotent_replay"
+	// MetricProviderEventsDelivered counts newly recorded provider delivered events.
+	MetricProviderEventsDelivered = "provider_events_delivered"
+	// MetricProviderEventsBounced counts newly recorded provider bounced events.
+	MetricProviderEventsBounced = "provider_events_bounced"
+	// MetricProviderEventsComplained counts newly recorded provider complained events.
+	MetricProviderEventsComplained = "provider_events_complained"
 	// MetricProviderDurationMS records provider attempt duration in milliseconds.
 	MetricProviderDurationMS = "provider_duration_ms"
 )
@@ -126,6 +134,10 @@ func NewFileStatsSink(config FileStatsSinkConfig) (*FileStatsSink, error) {
 
 // Record appends one stats event.
 func (s *FileStatsSink) Record(record StatsRecord) error {
+	if err := validateStatsRecord(record); err != nil {
+		return err
+	}
+
 	timestamp := record.Timestamp
 	if timestamp.IsZero() {
 		timestamp = s.now()
@@ -139,6 +151,9 @@ func (s *FileStatsSink) Summary(appCode string, since time.Time, until time.Time
 	if s.writer == nil {
 		return StatsSummary{}, fmt.Errorf("stats sink is closed")
 	}
+
+	s.writer.mu.Lock()
+	defer s.writer.mu.Unlock()
 
 	summary := newStatsSummary(appCode, since, until)
 	for _, path := range s.statsQueryPaths() {
@@ -210,7 +225,7 @@ func aggregateStatsPath(path string, summary *StatsSummary) error {
 	for scanner.Scan() {
 		record, err := decodeStatsRecord(scanner.Bytes())
 		if err != nil {
-			return err
+			continue
 		}
 		if record.AppCode != summary.AppCode {
 			continue
@@ -248,11 +263,7 @@ func decodeStatsRecord(line []byte) (StatsRecord, error) {
 	if err != nil {
 		return StatsRecord{}, fmt.Errorf("decode stats log timestamp: %w", err)
 	}
-	if raw.AppCode == "" || raw.Metric == "" {
-		return StatsRecord{}, fmt.Errorf("decode stats log record: required fields are invalid")
-	}
-
-	return StatsRecord{
+	record := StatsRecord{
 		Timestamp:           timestamp,
 		AppCode:             raw.AppCode,
 		SceneCode:           raw.SceneCode,
@@ -260,7 +271,12 @@ func decodeStatsRecord(line []byte) (StatsRecord, error) {
 		Transport:           raw.Transport,
 		Metric:              raw.Metric,
 		Value:               raw.Value,
-	}, nil
+	}
+	if err := validateStatsRecord(record); err != nil {
+		return StatsRecord{}, fmt.Errorf("decode stats log record: %w", err)
+	}
+
+	return record, nil
 }
 
 func accumulateProviderDuration(summary *StatsSummary, record StatsRecord) {
@@ -281,5 +297,61 @@ func finalizeProviderDurations(summary *StatsSummary) {
 			duration.AverageMS = duration.TotalMS / float64(duration.Count)
 		}
 		summary.ProviderDurations[channel] = duration
+	}
+}
+
+func validateStatsRecord(record StatsRecord) error {
+	if strings.TrimSpace(record.AppCode) == "" {
+		return fmt.Errorf("stats record app is required")
+	}
+	if !isKnownStatsMetric(record.Metric) {
+		return fmt.Errorf("stats record metric is invalid")
+	}
+	if math.IsNaN(record.Value) || math.IsInf(record.Value, 0) || record.Value < 0 {
+		return fmt.Errorf("stats record value must be a finite non-negative number")
+	}
+	if record.Transport != "" && !record.Transport.IsValid() {
+		return fmt.Errorf("stats record transport is invalid")
+	}
+	if isProviderAttemptStatsMetric(record.Metric) {
+		if strings.TrimSpace(record.ProviderChannelCode) == "" {
+			return fmt.Errorf("stats record provider channel is required")
+		}
+		if !record.Transport.IsValid() {
+			return fmt.Errorf("stats record transport is required")
+		}
+	} else if strings.TrimSpace(record.ProviderChannelCode) != "" || record.Transport != "" {
+		return fmt.Errorf("stats record provider fields are only allowed for provider attempt metrics")
+	}
+
+	return nil
+}
+
+func isKnownStatsMetric(metric string) bool {
+	switch metric {
+	case MetricMessagesQueued,
+		MetricMessagesSent,
+		MetricMessagesFailed,
+		MetricAttemptsSent,
+		MetricAttemptsFailed,
+		MetricRequestsRateLimited,
+		MetricRequestsQueueFull,
+		MetricRequestsIdempotentReplay,
+		MetricProviderEventsDelivered,
+		MetricProviderEventsBounced,
+		MetricProviderEventsComplained,
+		MetricProviderDurationMS:
+		return true
+	default:
+		return false
+	}
+}
+
+func isProviderAttemptStatsMetric(metric string) bool {
+	switch metric {
+	case MetricAttemptsSent, MetricAttemptsFailed, MetricProviderDurationMS:
+		return true
+	default:
+		return false
 	}
 }

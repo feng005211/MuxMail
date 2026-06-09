@@ -21,6 +21,7 @@ type BrevoAPIProvider struct {
 	secrets SecretResolver
 	client  *http.Client
 	baseURL string
+	now     func() time.Time
 }
 
 // BrevoAPIOption customizes the Brevo API provider.
@@ -32,6 +33,7 @@ func NewBrevoAPIProvider(secrets SecretResolver, options ...BrevoAPIOption) *Bre
 		secrets: secrets,
 		client:  &http.Client{Timeout: defaultBrevoHTTPTimeout},
 		baseURL: defaultBrevoBaseURL,
+		now:     time.Now,
 	}
 	for _, option := range options {
 		option(provider)
@@ -58,6 +60,15 @@ func WithBrevoBaseURL(baseURL string) BrevoAPIOption {
 	}
 }
 
+// WithBrevoNow overrides the clock used to interpret HTTP-date Retry-After headers.
+func WithBrevoNow(now func() time.Time) BrevoAPIOption {
+	return func(provider *BrevoAPIProvider) {
+		if now != nil {
+			provider.now = now
+		}
+	}
+}
+
 // Send sends one message through the Brevo transactional email API.
 func (p *BrevoAPIProvider) Send(ctx context.Context, request SendRequest) (SendResult, error) {
 	if err := ctx.Err(); err != nil {
@@ -66,12 +77,19 @@ func (p *BrevoAPIProvider) Send(ctx context.Context, request SendRequest) (SendR
 	if request.Account.Provider != domain.ProviderBrevo || request.Channel.Transport != domain.TransportAPI {
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "brevo api transport required"), nil
 	}
+	envelope, result, failed := normalizeProviderEnvelope(request)
+	if failed {
+		return result, nil
+	}
 
 	apiKey, err := p.apiKey(request)
 	if err != nil {
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "brevo api key unavailable"), nil
 	}
-	payload, err := buildBrevoPayload(request)
+	if !isVisibleASCIIWithoutWhitespaceSecret(apiKey) {
+		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "brevo api key invalid"), nil
+	}
+	payload, err := buildBrevoPayload(request, envelope)
 	if err != nil {
 		return MessagePermanentFailure(domain.ErrorCodeInternal, "brevo message build failed"), nil
 	}
@@ -98,7 +116,7 @@ func (p *BrevoAPIProvider) Send(ctx context.Context, request SendRequest) (SendR
 	}
 	defer response.Body.Close()
 
-	return decodeBrevoResponse(response), nil
+	return decodeBrevoResponse(response, p.now), nil
 }
 
 func (p *BrevoAPIProvider) apiKey(request SendRequest) (string, error) {
@@ -139,21 +157,21 @@ type brevoAddress struct {
 	Email string `json:"email"`
 }
 
-func buildBrevoPayload(request SendRequest) (brevoEmailPayload, error) {
+func buildBrevoPayload(request SendRequest, envelope providerEnvelope) (brevoEmailPayload, error) {
 	if request.Message.HTMLBody == "" && request.Message.TextBody == "" {
 		return brevoEmailPayload{}, fmt.Errorf("message body is required")
 	}
-	if request.Channel.From == "" || request.Message.ToEmail == "" || request.Message.Subject == "" {
-		return brevoEmailPayload{}, fmt.Errorf("message address and subject are required")
+	if request.Message.Subject == "" {
+		return brevoEmailPayload{}, fmt.Errorf("message subject is required")
 	}
 
 	return brevoEmailPayload{
 		Sender: brevoAddress{
 			Name:  request.Channel.FromName,
-			Email: request.Channel.From,
+			Email: envelope.from,
 		},
 		To: []brevoAddress{
-			{Email: strings.TrimSpace(request.Message.ToEmail)},
+			{Email: envelope.to},
 		},
 		Subject:     request.Message.Subject,
 		HTMLContent: request.Message.HTMLBody,
@@ -177,25 +195,25 @@ type brevoErrorResponse struct {
 	Message string `json:"message"`
 }
 
-func decodeBrevoResponse(response *http.Response) SendResult {
+func decodeBrevoResponse(response *http.Response, now func() time.Time) SendResult {
 	if response.StatusCode >= 200 && response.StatusCode <= 299 {
 		var accepted brevoAcceptedResponse
-		if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
-			return TemporaryFailure(domain.ErrorCodeProviderUnavailable, "brevo accepted response invalid")
-		}
-		if accepted.MessageID != "" {
-			return Accepted(accepted.MessageID)
-		}
-		if len(accepted.MessageIDs) > 0 && accepted.MessageIDs[0] != "" {
-			return Accepted(accepted.MessageIDs[0])
+		if err := json.NewDecoder(response.Body).Decode(&accepted); err == nil {
+			if accepted.MessageID != "" {
+				return Accepted(accepted.MessageID)
+			}
+			if len(accepted.MessageIDs) > 0 && accepted.MessageIDs[0] != "" {
+				return Accepted(accepted.MessageIDs[0])
+			}
 		}
 
-		return TemporaryFailure(domain.ErrorCodeProviderUnavailable, "brevo accepted response invalid")
+		// A 2xx response means Brevo accepted the request; retrying here can duplicate delivery.
+		return Accepted("")
 	}
 
 	errorResponse := readBrevoError(response)
 	result := classifyBrevoHTTPFailure(response.StatusCode, errorResponse)
-	if retryAfter := parseRetryAfterSeconds(response.Header.Get("Retry-After")); retryAfter > 0 {
+	if retryAfter := parseRetryAfterSeconds(response.Header.Get("Retry-After"), now); retryAfter > 0 {
 		result = WithRetryAfter(result, retryAfter)
 	}
 
@@ -217,6 +235,8 @@ func classifyBrevoHTTPFailure(statusCode int, errorResponse brevoErrorResponse) 
 	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || statusCode == http.StatusPaymentRequired:
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "brevo channel failure")
 	case strings.Contains(errorCode, "unauthorized") || strings.Contains(errorCode, "permission"):
+		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "brevo channel failure")
+	case containsSenderConfigurationHint(errorCode) || containsSenderConfigurationHint(errorResponse.Message):
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "brevo channel failure")
 	case containsBrevoDomainFailure(message):
 		return ChannelFailure(domain.ErrorCodeProviderUnavailable, "brevo channel failure")
